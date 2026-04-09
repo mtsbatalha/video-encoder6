@@ -1,7 +1,8 @@
 """FFmpeg subprocess execution engine with real-time progress tracking.
 
-Uses sync subprocess + ThreadPoolExecutor. The main thread polls
-a shared state dict to update Rich Progress bars in real time.
+Uses frame counting (total_frames via ffprobe vs out_video_frames from
+FFmpeg's -progress output) for accurate progress reporting, matching
+how ffpb displays progress.
 """
 
 from __future__ import annotations
@@ -32,7 +33,6 @@ class ConversionResult:
     details: str = ""
 
 
-# Shared progress state: {input_path: {"pct": int, "speed": str}}
 class ProgressState:
     """Thread-safe progress state shared between worker threads and main thread."""
 
@@ -56,17 +56,15 @@ class ProgressState:
     def mark_started(self, key: str) -> None:
         with self._lock:
             if key not in self._data:
-                self._data[key] = {"pct": 0, "speed": "", "started": True}
-            else:
-                self._data[key]["started"] = True
-
-    def get_started_keys(self) -> set[str]:
-        with self._lock:
-            return {k for k, v in self._data.items() if v.get("started")}
+                self._data[key] = {"pct": 0, "speed": ""}
 
 
-def _get_duration(input_path: str) -> float | None:
-    """Get video duration in seconds using ffprobe."""
+def _get_video_frame_count(input_path: str) -> int:
+    """Get total number of video frames using ffprobe.
+
+    This is more accurate than duration-based progress because frames
+    are processed sequentially by the encoder.
+    """
     creation_flags = 0
     if sys.platform == "win32":
         creation_flags = subprocess.CREATE_NO_WINDOW
@@ -76,20 +74,22 @@ def _get_duration(input_path: str) -> float | None:
             [
                 "ffprobe",
                 "-v", "error",
-                "-show_entries", "format=duration",
+                "-count_frames",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=nb_read_frames",
                 "-of", "default=noprint_wrappers=1:nokey=1",
                 input_path,
             ],
             capture_output=True,
             creationflags=creation_flags,
-            timeout=30,
+            timeout=120,
         )
         out = result.stdout.decode("utf-8", errors="replace").strip()
-        if out:
-            return float(out)
+        if out and out.isdigit():
+            return int(out)
     except Exception:
         pass
-    return None
+    return 0
 
 
 def _read_progress_file(path: str) -> dict:
@@ -105,15 +105,6 @@ def _read_progress_file(path: str) -> dict:
     except (OSError, IOError):
         pass
     return data
-
-
-def _parse_time_seconds(time_str: str) -> float | None:
-    """Convert FFmpeg time string (HH:MM:SS.xxxxxx) to seconds."""
-    m = re.match(r"(\d{2}):(\d{2}):(\d{2})\.(\d+)", time_str)
-    if m:
-        h, mi, s, frac = m.groups()
-        return int(h) * 3600 + int(mi) * 60 + float(f"{s}.{frac}")
-    return None
 
 
 def _inject_progress_flag(cmd: list[str], progress_file: str) -> list[str]:
@@ -135,10 +126,11 @@ def _run_ffmpeg_worker(
     cmd: list[str],
     progress: ProgressState,
 ) -> ConversionResult:
-    """Worker function: runs FFmpeg and reports progress to shared state."""
+    """Worker function: runs FFmpeg and reports progress via frame counting."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    total_seconds = _get_duration(input_path)
+    # Get total video frames for progress calculation
+    total_frames = _get_video_frame_count(input_path)
 
     progress_fd, progress_file = tempfile.mkstemp(suffix=".progress")
     os.close(progress_fd)
@@ -157,7 +149,7 @@ def _run_ffmpeg_worker(
             creationflags=creation_flags,
         )
 
-        # Signal that this conversion has started
+        # Signal start
         progress.mark_started(input_path)
 
         stderr_lines: list[str] = []
@@ -172,32 +164,25 @@ def _run_ffmpeg_worker(
         t_stderr = threading.Thread(target=read_stderr, daemon=True)
         t_stderr.start()
 
-        # Poll progress and update shared state
+        # Poll progress file
         while process.poll() is None:
             time.sleep(0.2)
             data = _read_progress_file(progress_file)
-            if data:
-                out_time_ms = data.get("out_time_ms", "")
-                current_seconds = None
-                if out_time_ms and out_time_ms != "N/A":
-                    try:
-                        current_seconds = float(out_time_ms) / 1_000_000
-                    except ValueError:
-                        pass
+            if not data:
+                continue
 
-                if current_seconds is None:
-                    t = data.get("out_time", "")
-                    if t and t != "N/A":
-                        current_seconds = _parse_time_seconds(t)
+            # out_video_frames is the number of encoded video frames
+            frames = data.get("out_video_frames", "")
+            speed = data.get("speed", "")
+            speed_str = speed if speed and speed != "N/A" else ""
 
-                speed = data.get("speed", "")
-                speed_str = speed if speed and speed != "N/A" else ""
-
-                if current_seconds and total_seconds:
-                    pct = min(int((current_seconds / total_seconds) * 100), 99)
-                    progress.set(input_path, pct, speed_str)
-                elif current_seconds:
-                    progress.set(input_path, 1, speed_str)
+            if frames and frames.isdigit():
+                encoded = int(frames)
+                if total_frames > 0:
+                    pct = min(int((encoded / total_frames) * 100), 99)
+                else:
+                    pct = min(encoded // 10, 99)  # rough fallback
+                progress.set(input_path, pct, speed_str)
 
         t_stderr.join(timeout=2)
 
@@ -245,7 +230,7 @@ async def run_conversion(
     cmd: list[str],
     progress_callback: Callable[[int, str], None] | None = None,
 ) -> ConversionResult:
-    """Run a single conversion synchronously (for single-file mode)."""
+    """Run a single conversion. Wraps worker for API compatibility."""
     progress = ProgressState()
 
     loop = asyncio.get_running_loop()
@@ -254,7 +239,6 @@ async def run_conversion(
         lambda: _run_ffmpeg_worker(input_path, output_path, cmd, progress),
     )
 
-    # Report final state via callback
     if progress_callback:
         if result.success:
             progress_callback(100, "Concluído")
@@ -272,12 +256,11 @@ async def run_batch_conversions(
     """Run batch conversions with real-time progress polling from main thread.
 
     Worker threads update ProgressState. The main thread polls and calls
-    the callback with latest values, then waits for all to finish.
+    the callback with latest values.
     """
     progress = ProgressState()
     results: list[ConversionResult] = [None] * len(jobs)  # type: ignore[list-item]
 
-    # Map input_path -> index
     path_to_idx = {job["input_path"]: i for i, job in enumerate(jobs)}
 
     with ThreadPoolExecutor(max_workers=max_parallel) as executor:
@@ -292,11 +275,11 @@ async def run_batch_conversions(
             )
             futures[future] = job["input_path"]
 
-        # Main thread: poll progress state and call callback
+        # Main thread: poll progress and update Rich Progress
         known_started: set[str] = set()
         all_done = False
         while not all_done:
-            await asyncio.sleep(0.2)  # Yield to event loop for Rich Progress refresh
+            await asyncio.sleep(0.2)
             snapshot = progress.snapshot()
             for key, state in snapshot.items():
                 if key in path_to_idx:
@@ -309,7 +292,6 @@ async def run_batch_conversions(
 
             all_done = all(f.done() for f in futures)
 
-        # Collect results
         for future, input_path in futures.items():
             idx = path_to_idx[input_path]
             results[idx] = future.result()
