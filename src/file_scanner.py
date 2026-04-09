@@ -1,10 +1,14 @@
-"""File discovery and external subtitle detection."""
+"""File discovery, external subtitle detection, and HDR detection."""
 
+import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".webm", ".wmv", ".flv", ".m4v"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".sub", ".idx", ".vtt", ".smi"}
+HDR_TRANSFER_CHARACTERISTICS = {"smpte2084", "arib-std-b67"}
 
 
 def scan_video_files(path: str) -> list[str]:
@@ -50,3 +54,44 @@ def build_output_path(input_path: str, output_dir: str, suffix: str) -> str:
     base = Path(input_path).stem
     filename = f"{base}_{suffix}.mkv"
     return os.path.join(folder, filename)
+
+
+def detect_hdr(input_path: str) -> bool:
+    """Detect if a video file is HDR by checking color transfer characteristics.
+
+    Uses ffprobe to read color_transfer (transfer characteristics).
+    HDR is identified by smpte2084 (PQ) or arib-std-b67 (HLG).
+    Returns True if HDR, False if SDR or unable to determine.
+    """
+    creation_flags = 0
+    if sys.platform == "win32":
+        creation_flags = subprocess.CREATE_NO_WINDOW
+
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=color_transfer,color_primaries,color_space",
+                "-of", "json",
+                input_path,
+            ],
+            capture_output=True,
+            creationflags=creation_flags,
+            timeout=30,
+        )
+        output = result.stdout.decode("utf-8", errors="replace")
+        data = json.loads(output)
+
+        streams = data.get("streams", [])
+        if not streams:
+            return False
+
+        stream = streams[0]
+        color_transfer = stream.get("color_transfer", "")
+        return color_transfer in HDR_TRANSFER_CHARACTERISTICS
+
+    except Exception:
+        # If detection fails, default to SDR (safest assumption)
+        return False

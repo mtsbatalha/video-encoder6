@@ -324,6 +324,24 @@ def prompt_job_id(queue: QueueManager, action: str) -> str | None:
     return job_id
 
 
+def prompt_conversion_mode() -> str:
+    """Ask user to choose between manual or automatic profile selection.
+
+    Returns 'manual' or 'auto'.
+    """
+    console.print("\n[bold]Modo de seleção de perfil:[/bold]\n")
+    console.print("  [1] Manual — Escolher o perfil manualmente")
+    console.print("  [2] Automático — Detectar HDR/SDR e mostrar perfis compatíveis\n")
+
+    choice = Prompt.ask(
+        "Escolha o modo",
+        choices=["1", "2"],
+        default="2",
+        console=console,
+    )
+    return "auto" if choice == "2" else "manual"
+
+
 def prompt_source_type() -> str:
     """Ask if the source is local or remote. Returns 'local' or 'remote'."""
     console.print("\n[bold]Tipo de origem:[/bold]\n")

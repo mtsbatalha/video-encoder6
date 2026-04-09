@@ -12,9 +12,10 @@ from rich.panel import Panel
 from src.encoder import run_conversion
 from src.file_scanner import (
     build_output_path,
+    detect_hdr,
     scan_video_files,
 )
-from src.profiles import list_profiles
+from src.profiles import get_matching_profiles, list_profiles
 from src.queue_manager import QueueManager
 from src.tui import (
     add_conversion_task,
@@ -22,6 +23,7 @@ from src.tui import (
     create_progress,
     print_batch_preview,
     print_file_info,
+    prompt_conversion_mode,
     select_profile_menu,
     show_banner,
     show_main_menu,
@@ -95,8 +97,6 @@ def save_config(config: dict) -> None:
 
 async def convert_single_file(config: dict, queue: QueueManager) -> None:
     """Handle single file conversion workflow — adds to queue."""
-    profiles = list_profiles()
-
     console.print("[bold]Conversão de Arquivo Único[/bold]\n")
 
     # Ask if source is local or remote
@@ -144,6 +144,17 @@ async def convert_single_file(config: dict, queue: QueueManager) -> None:
             console.print("[red]Arquivo não encontrado.[/red]")
             return
 
+    # Choose manual or automatic mode
+    mode = prompt_conversion_mode()
+
+    if mode == "auto":
+        is_hdr = detect_hdr(input_path)
+        hdr_label = "HDR detectado" if is_hdr else "SDR detectado"
+        console.print(f"[green]{hdr_label}[/green]\n")
+        profiles = get_matching_profiles(is_hdr)
+    else:
+        profiles = list_profiles()
+
     # Select profile
     profile = select_profile_menu(profiles)
     if not profile:
@@ -177,8 +188,6 @@ async def convert_single_file(config: dict, queue: QueueManager) -> None:
 
 async def convert_batch(config: dict, queue: QueueManager) -> None:
     """Handle batch folder conversion workflow — adds to queue."""
-    profiles = list_profiles()
-
     console.print("[bold]Conversão em Lote[/bold]\n")
 
     # Ask if source is local or remote
@@ -224,6 +233,18 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
         return
 
     console.print(f"[green]{len(files)}[/green] arquivo(s) encontrado(s).")
+
+    # Choose manual or automatic mode
+    mode = prompt_conversion_mode()
+
+    if mode == "auto":
+        # Detect HDR from first file as reference for entire batch
+        is_hdr = detect_hdr(files[0])
+        hdr_label = "HDR detectado" if is_hdr else "SDR detectado"
+        console.print(f"[green]{hdr_label} (baseado no primeiro arquivo)[/green]\n")
+        profiles = get_matching_profiles(is_hdr)
+    else:
+        profiles = list_profiles()
 
     # Select profile
     profile = select_profile_menu(profiles)
