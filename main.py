@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -89,6 +90,8 @@ def load_config() -> dict:
         "ffmpeg_path": "ffmpeg",
         "on_file_exists": "skip",  # skip, overwrite, copy
         "cleanup_remote_files": "always",  # always, never, ask
+        "temp_dir_enabled": False,
+        "temp_dir": os.path.join(os.getcwd(), "temp_conversion"),
     }
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -422,6 +425,14 @@ async def process_queue(config: dict, queue: QueueManager) -> None:
 
             cmd = profile.build_command(job.input_path, job.output_path)
 
+            # Temp dir: convert to temp path, then copy on success
+            temp_output = None
+            if config.get("temp_dir_enabled"):
+                temp_base = config["temp_dir"]
+                os.makedirs(temp_base, exist_ok=True)
+                temp_output = os.path.join(temp_base, f"{job.id}_{Path(job.output_path).name}")
+                cmd = profile.build_command(job.input_path, temp_output)
+
             # Create progress task
             task_id = add_conversion_task(progress, Path(job.input_path).name)
 
@@ -439,6 +450,15 @@ async def process_queue(config: dict, queue: QueueManager) -> None:
             result = await run_conversion(
                 job.input_path, job.output_path, cmd, progress_callback=_cb
             )
+
+            # Temp dir: copy final file or clean up
+            if temp_output and os.path.exists(temp_output):
+                if result.success:
+                    os.makedirs(os.path.dirname(job.output_path), exist_ok=True)
+                    shutil.copy2(temp_output, job.output_path)
+                    os.remove(temp_output)
+                else:
+                    os.remove(temp_output)
 
             # Final save
             queue.save()
@@ -528,8 +548,18 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
                         break
         elif choice == "9":
             if Confirm.ask("Limpar toda a fila?", default=False, console=console):
-                queue.clear_all()
-                console.print("[green]Fila limpa.[/green]\n")
+                delete_outputs = Confirm.ask(
+                    "Remover também os arquivos de saída gerados?",
+                    default=False,
+                    console=console,
+                )
+                temp_dir = config["temp_dir"] if config.get("temp_dir_enabled") else None
+                deleted = queue.clear_all(delete_outputs=delete_outputs, temp_dir=temp_dir)
+                console.print("[green]Fila limpa.[/green]")
+                if delete_outputs and deleted:
+                    console.print(f"[dim]{deleted} arquivo(s) removido(s).[/dim]\n")
+                else:
+                    console.print()
 
 
 async def kill_ffmpeg_processes() -> None:
@@ -602,7 +632,10 @@ async def settings_menu(config: dict) -> None:
     console.print(f"  Arquivos existentes: [cyan]{labels.get(config['on_file_exists'], config['on_file_exists'])}[/cyan]")
 
     cleanup_labels = {"always": "Deletar após conversão", "never": "Manter", "ask": "Perguntar"}
-    console.print(f"  Arquivos remotos: [cyan]{cleanup_labels.get(config['cleanup_remote_files'], config['cleanup_remote_files'])}[/cyan]\n")
+    console.print(f"  Arquivos remotos: [cyan]{cleanup_labels.get(config['cleanup_remote_files'], config['cleanup_remote_files'])}[/cyan]")
+
+    temp_status = "[green]Ativado[/green]" if config.get("temp_dir_enabled") else "[dim]Desativado[/dim]"
+    console.print(f"  Diretório temporário: {temp_status} [cyan]{config['temp_dir']}[/cyan]\n")
 
     # Output directory
     new_dir = Prompt.ask(
@@ -659,6 +692,29 @@ async def settings_menu(config: dict) -> None:
     if cleanup_choice in cleanup_map:
         config["cleanup_remote_files"] = cleanup_map[cleanup_choice]
 
+    # Temp dir enabled
+    console.print("\n[yellow]Diretório temporário de conversão:[/yellow]")
+    console.print("  [dim]1[/dim] - Desativado (padrão)")
+    console.print("  [dim]2[/dim] - Ativado (converte no temp, copia ao final)")
+    temp_map = {"1": False, "2": True}
+    inverse_temp = {False: "1", True: "2"}
+    temp_choice = Prompt.ask(
+        "Escolha (1-2, Enter para manter)",
+        default=inverse_temp.get(config.get("temp_dir_enabled", False), "1"),
+        console=console,
+    ).strip()
+    if temp_choice in temp_map:
+        config["temp_dir_enabled"] = temp_map[temp_choice]
+
+    # Temp dir path
+    new_temp = Prompt.ask(
+        "Caminho do diretório temporário (Enter para manter)",
+        default=config["temp_dir"],
+        console=console,
+    ).strip()
+    if new_temp:
+        config["temp_dir"] = os.path.abspath(new_temp)
+
     save_config(config)
     console.print("\n[green]Configurações salvas.[/green]")
 
@@ -682,6 +738,10 @@ async def main() -> None:
 
     # Ensure output directory exists
     os.makedirs(config["output_dir"], exist_ok=True)
+
+    # Ensure temp directory exists if enabled
+    if config.get("temp_dir_enabled"):
+        os.makedirs(config["temp_dir"], exist_ok=True)
 
     while True:
         show_banner()

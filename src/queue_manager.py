@@ -237,10 +237,38 @@ class QueueManager:
             "paused": self._paused,
         }
 
-    def clear_all(self) -> None:
+    def clear_all(self, delete_outputs: bool = False, temp_dir: str | None = None) -> int:
+        """Clear all jobs. If delete_outputs is True, also remove generated output files.
+        If temp_dir is provided, also remove pending temp files ({temp_dir}/{job_id}_{filename}).
+
+        Returns the number of files deleted.
+        """
+        deleted = 0
+        if delete_outputs:
+            for job in self._jobs:
+                output = job.output_path
+                if output and os.path.exists(output):
+                    try:
+                        os.remove(output)
+                        deleted += 1
+                    except OSError:
+                        pass
+
+        if temp_dir:
+            for job in self._jobs:
+                filename = Path(job.output_path).name
+                temp_path = os.path.join(temp_dir, f"{job.id}_{filename}")
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                        deleted += 1
+                    except OSError:
+                        pass
+
         self._jobs = []
         self._paused = False
         self.save()
+        return deleted
 
     # ─── Remote Temp Dir Tracking ────────────────────────────────────
 
