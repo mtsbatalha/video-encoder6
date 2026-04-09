@@ -568,13 +568,16 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
     global _queue_task, _current_conversion
 
     while True:
+        # Yield to let background queue task run before showing menu
+        await asyncio.sleep(0)
+
         choice = show_queue_menu(queue)
 
         if choice == "0":
             return
         elif choice == "1":
             # Ver fila — real-time read-only viewer
-            watch_queue_live(queue)
+            await watch_queue_live(queue)
         elif choice == "2":
             if _queue_task and not _queue_task.done():
                 console.print("[yellow]Fila já está sendo processada em segundo plano.[/yellow]\n")
@@ -582,6 +585,8 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
                 console.print("[yellow]Nenhum job pendente ou agendado na fila.[/yellow]\n")
             else:
                 _queue_task = asyncio.create_task(process_queue(config, queue))
+                # Yield immediately so the background task can start
+                await asyncio.sleep(0)
                 console.print("[green]Processamento iniciado![/green]\n")
         elif choice == "3":
             new_state = queue.toggle_pause()
@@ -645,6 +650,9 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
                 temp_dir = config["temp_dir"] if config.get("temp_dir_enabled") else None
                 deleted = queue.clear_all(delete_outputs=delete_outputs, temp_dir=temp_dir)
                 console.print("[green]Fila limpa.[/green]\n")
+
+        # Yield after each action so background task can make progress
+        await asyncio.sleep(0)
 
 
 async def kill_ffmpeg_processes() -> None:
@@ -842,6 +850,9 @@ async def main() -> None:
     os.makedirs(config.get("remote_dir", os.path.join(os.getcwd(), "remote_files")), exist_ok=True)
 
     while True:
+        # Yield to let background queue task run before showing menu
+        await asyncio.sleep(0)
+
         show_banner()
 
         # Show background task status on main menu
@@ -876,6 +887,9 @@ async def main() -> None:
                     pass
             console.print("[dim]Até mais![/dim]\n")
             break
+
+        # Yield to let background queue task run before waiting for Enter
+        await asyncio.sleep(0)
 
         # Non-blocking wait for Enter — lets background tasks run
         await asyncio.to_thread(input, "\nPressione Enter para continuar...")

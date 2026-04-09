@@ -536,12 +536,15 @@ def show_queue_menu(queue: QueueManager) -> str:
     )
 
 
-def watch_queue_live(queue: QueueManager) -> None:
+async def watch_queue_live(queue: QueueManager) -> None:
     """Real-time queue viewer (read-only).
 
     Shows the queue table updating live. Press any key (0-9) to exit.
     No commands are processed here — this is purely for observation.
+    Yields to the asyncio event loop each cycle so background tasks run.
     """
+    import asyncio as _asyncio
+
     _is_win = sys.platform == "win32"
     if _is_win:
         try:
@@ -690,7 +693,8 @@ def watch_queue_live(queue: QueueManager) -> None:
             ch = _read_key()
             if ch is not None:
                 return
-            time.sleep(0.3)
+            # Yield to event loop so background queue processing can run
+            await _asyncio.sleep(0.3)
     except KeyboardInterrupt:
         pass
     finally:
