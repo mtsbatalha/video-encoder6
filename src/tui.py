@@ -568,12 +568,18 @@ def interactive_queue_menu(
     key_reader = _KeyReader()
     key_reader.start()
     try:
-        with Live(_make_panel(), console=console, refresh_per_second=2, screen=False) as live:
+        _last_rendered = None
+        with Live(_make_panel(), console=console, refresh_per_second=1, screen=False) as live:
             try:
                 while True:
-                    live.update(_make_panel())
+                    panel = _make_panel()
+                    # Only update when content actually changed to prevent flickering
+                    panel_text = str(panel)
+                    if panel_text != _last_rendered:
+                        _last_rendered = panel_text
+                        live.update(panel, refresh=True)
 
-                    ch = key_reader.get_key(timeout=0.15)
+                    ch = key_reader.get_key(timeout=0.5)
                     if ch is None:
                         continue
 
@@ -592,7 +598,7 @@ def interactive_queue_menu(
                                 key_reader.start()
                         else:
                             on_command(ch)
-                        live.update(_make_panel())
+                        _last_rendered = None  # Force refresh after command
             except KeyboardInterrupt:
                 return False
     finally:
