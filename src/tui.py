@@ -14,10 +14,12 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from rich.prompt import Prompt
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
+from rich.text import Text
 
 from src.profiles import ConversionProfile
+from src.queue_manager import QueueManager, QueueJob
 
 console = Console()
 
@@ -41,11 +43,12 @@ def show_main_menu() -> str:
     console.print("  [1] Converter arquivo único")
     console.print("  [2] Conversão em lote (pasta)")
     console.print("  [3] Configurações")
-    console.print("  [4] Sair\n")
+    console.print("  [4] Gerenciar fila")
+    console.print("  [5] Sair\n")
 
     choice = Prompt.ask(
         "Escolha uma opção",
-        choices=["1", "2", "3", "4"],
+        choices=["1", "2", "3", "4", "5"],
         default="1",
         console=console,
     )
@@ -199,3 +202,123 @@ def _format_size(size_bytes: int) -> str:
             return f"{size_bytes:.1f} {unit}"
         size_bytes /= 1024
     return f"{size_bytes:.1f} PB"
+
+
+def show_queue_table(queue: QueueManager) -> None:
+    """Display the current queue as a formatted table."""
+    stats = queue.get_stats()
+    paused = stats["paused"]
+    status_tag = "[red]PAUSADA[/red]" if paused else "[green]ATIVA[/green]"
+
+    console.print(
+        Panel(
+            f"Estado: {status_tag}  |  "
+            f"Pendentes: [yellow]{stats['pending']}[/yellow]  "
+            f"Rodando: [blue]{stats['running']}[/blue]  "
+            f"Concluídas: [green]{stats['completed']}[/green]  "
+            f"Falhas: [red]{stats['failed']}[/red]  "
+            f"Agendadas: [cyan]{stats['scheduled']}[/cyan]",
+            title="[bold]Fila de Conversão[/bold]",
+            border_style="cyan",
+        )
+    )
+
+    if not queue.jobs:
+        console.print("[dim]  (fila vazia)[/dim]")
+        console.print()
+        return
+
+    table = Table(show_header=True, header_style="bold cyan", border_style="dim")
+    table.add_column("#", style="yellow", width=3)
+    table.add_column("ID", style="dim", width=10)
+    table.add_column("Arquivo", style="white")
+    table.add_column("Perfil", style="cyan", width=12)
+    table.add_column("Progresso", style="white", width=10)
+    table.add_column("Velocidade", style="dim", width=8)
+    table.add_column("Status", style="white", width=12)
+
+    pending_idx = 0
+    for j in queue.jobs:
+        pending_idx += 1
+        # Status color
+        status_map = {
+            "pending": "[yellow]Pendente[/yellow]",
+            "running": "[blue]Rodando[/blue]",
+            "completed": "[green]Concluído[/green]",
+            "failed": "[red]Falha[/red]",
+            "paused": "[magenta]Pausado[/magenta]",
+            "scheduled": "[cyan]Agendado[/cyan]",
+        }
+        status_text = status_map.get(j.status, j.status)
+
+        # Progress bar visualization
+        if j.status == "completed":
+            progress_bar = "[green]██████████[/green]"
+        elif j.status == "failed":
+            progress_bar = "[red]██████████[/red]"
+        elif j.progress_pct > 0:
+            filled = j.progress_pct // 10
+            empty = 10 - filled
+            progress_bar = f"[yellow]{'█' * filled}{'░' * empty}[/yellow]"
+        else:
+            progress_bar = "[dim]░░░░░░░░░░[/dim]"
+
+        progress_text = f"{j.progress_pct}%"
+        speed_text = j.speed or ""
+        filename = Path(j.input_path).name
+
+        table.add_row(
+            str(pending_idx),
+            j.id,
+            filename,
+            j.profile_name[:12] if j.profile_name else "",
+            progress_text,
+            speed_text,
+            status_text,
+        )
+
+    console.print(table)
+    console.print()
+
+
+def show_queue_menu(queue: QueueManager) -> str:
+    """Show queue management menu and return choice."""
+    console.print("[bold]Gerenciar Fila:[/bold]\n")
+    console.print("  [1] Processar fila")
+    console.print("  [2] Pausar / Retomar")
+    console.print("  [3] Mover job para cima")
+    console.print("  [4] Mover job para baixo")
+    console.print("  [5] Remover job")
+    console.print("  [6] Remover concluídos")
+    console.print("  [7] Retentar falhas")
+    console.print("  [8] Agendar job")
+    console.print("  [9] Limpar fila")
+    console.print("  [0] Voltar\n")
+
+    choices = [str(i) for i in range(10)]
+    return Prompt.ask(
+        "Escolha uma opção",
+        choices=choices,
+        default="0",
+        console=console,
+    )
+
+
+def prompt_job_id(queue: QueueManager, action: str) -> str | None:
+    """Prompt for a valid job ID from the queue."""
+    jobs = queue.jobs
+    if not jobs:
+        console.print("[yellow]Fila vazia.[/yellow]")
+        return None
+
+    valid = [j.id for j in jobs]
+    job_id = Prompt.ask(
+        f"ID do job para {action} ({', '.join(valid)})",
+        console=console,
+    ).strip()
+
+    if job_id not in valid:
+        console.print(f"[yellow]Job '{job_id}' não encontrado.[/yellow]")
+        return None
+    return job_id
+
