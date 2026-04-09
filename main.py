@@ -35,6 +35,7 @@ from src.tui import (
     select_profile_menu,
     show_banner,
     show_main_menu,
+    show_others_menu,
     show_queue_table,
     show_queue_menu,
     prompt_job_id,
@@ -661,10 +662,15 @@ async def settings_menu(config: dict) -> None:
     save_config(config)
     console.print("\n[green]Configurações salvas.[/green]")
 
-    # Maintenance option
-    console.print()
-    if Confirm.ask("Encerrar todos os processos FFmpeg em execução?", default=False, console=console):
-        await kill_ffmpeg_processes()
+
+async def others_menu() -> None:
+    """Show 'Outros' submenu with utility tools."""
+    while True:
+        choice = show_others_menu()
+        if choice == "0":
+            break
+        elif choice == "1":
+            await kill_ffmpeg_processes()
 
 
 async def main() -> None:
@@ -696,10 +702,12 @@ async def main() -> None:
         elif choice == "2":
             await convert_batch(config, queue)
         elif choice == "3":
-            await settings_menu(config)
-        elif choice == "4":
             await manage_queue_menu(config, queue)
+        elif choice == "4":
+            await settings_menu(config)
         elif choice == "5":
+            await others_menu()
+        elif choice == "6":
             # Cancel background task if running
             if _queue_task and not _queue_task.done():
                 console.print("\n[yellow]Conversão em andamento. Aguardando finalização...[/yellow]")

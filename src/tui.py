@@ -42,14 +42,30 @@ def show_main_menu() -> str:
     console.print("[bold]Menu Principal:[/bold]\n")
     console.print("  [1] Converter arquivo único")
     console.print("  [2] Conversão em lote (pasta)")
-    console.print("  [3] Configurações")
-    console.print("  [4] Gerenciar fila")
-    console.print("  [5] Sair\n")
+    console.print("  [3] Gerenciar fila")
+    console.print("  [4] Configurações")
+    console.print("  [5] Outros")
+    console.print("  [6] Sair\n")
 
     choice = Prompt.ask(
         "Escolha uma opção",
-        choices=["1", "2", "3", "4", "5"],
+        choices=["1", "2", "3", "4", "5", "6"],
         default="1",
+        console=console,
+    )
+    return choice
+
+
+def show_others_menu() -> str:
+    """Show the 'Outros' submenu and return the user's choice."""
+    console.print("[bold]Outros:[/bold]\n")
+    console.print("  [1] Encerrar processos FFmpeg")
+    console.print("  [0] Voltar\n")
+
+    choice = Prompt.ask(
+        "Escolha uma opção",
+        choices=["0", "1"],
+        default="0",
         console=console,
     )
     return choice
