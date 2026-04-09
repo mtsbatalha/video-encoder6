@@ -129,13 +129,14 @@ class QueueManager:
         self.save()
         return job
 
-    def remove(self, job_id: str) -> bool:
+    def remove(self, job_id: str, cancel_running: bool = False) -> bool:
         for i, j in enumerate(self._jobs):
             if j.id == job_id:
-                if j.status not in ("running",):
-                    self._jobs.pop(i)
-                    self.save()
-                    return True
+                if j.status == "running" and not cancel_running:
+                    return False
+                self._jobs.pop(i)
+                self.save()
+                return True
         return False
 
     def remove_completed(self) -> int:

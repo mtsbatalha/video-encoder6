@@ -52,6 +52,7 @@ from src.remote import (
 
 # Background queue processing task
 _queue_task: asyncio.Task | None = None
+_current_conversion: asyncio.Task | None = None
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
@@ -395,6 +396,26 @@ def _handle_remote_cleanup(config: dict, queue: QueueManager) -> None:
         queue.mark_remote_dirs_cleaned(cleaned_ids)
 
 
+def _kill_ffmpeg_for_job(job) -> None:
+    """Kill ffmpeg processes related to a specific job."""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "ffmpeg.exe"],
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        else:
+            subprocess.run(
+                ["pkill", "-9", "ffmpeg"],
+                capture_output=True,
+                text=True,
+            )
+    except Exception:
+        pass
+
+
 async def process_queue(config: dict, queue: QueueManager) -> None:
     """Process the queue sequentially, respecting pause state.
 
@@ -409,6 +430,8 @@ async def process_queue(config: dict, queue: QueueManager) -> None:
 
     # Import profiles to build commands
     from src.profiles import get_profile
+
+    global _current_conversion
 
     with create_progress() as progress:
         while True:
@@ -450,9 +473,26 @@ async def process_queue(config: dict, queue: QueueManager) -> None:
                     _last_save = now
                     queue.save()
 
-            result = await run_conversion(
-                job.input_path, job.output_path, cmd, progress_callback=_cb
-            )
+            try:
+                _current_conversion = asyncio.create_task(
+                    run_conversion(job.input_path, job.output_path, cmd, progress_callback=_cb)
+                )
+                result = await _current_conversion
+                _current_conversion = None
+            except asyncio.CancelledError:
+                # Job was removed while running
+                console.print(f"[yellow]Job {job.id} cancelado pelo usuário.[/yellow]")
+                # Kill ffmpeg process if still running
+                _kill_ffmpeg_for_job(job)
+                if temp_output and os.path.exists(temp_output):
+                    try:
+                        os.remove(temp_output)
+                    except OSError:
+                        pass
+                queue.mark_job_done(job.id, False, "Cancelado pelo usuário")
+                queue.save()
+                console.print("[dim]Fila finalizada após cancelamento.[/dim]")
+                return
 
             # Temp dir: copy final file or clean up
             if temp_output and os.path.exists(temp_output):
@@ -496,7 +536,7 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
         return _queue_task is not None and not _queue_task.done()
 
     def _handle_command(ch: str) -> None:
-        global _queue_task
+        global _queue_task, _current_conversion
         if ch == "1":
             if _queue_task and not _queue_task.done():
                 console.print("[yellow]Fila já está sendo processada em segundo plano.[/yellow]\n")
@@ -519,8 +559,17 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
                 console.print("[green]Job movido para baixo.[/green]\n")
         elif ch == "5":
             job_id = prompt_job_id(queue, "remover")
-            if job_id and queue.remove(job_id):
-                console.print("[green]Job removido.[/green]\n")
+            if job_id:
+                # Check if job is currently running
+                running_job = next((j for j in queue.jobs if j.id == job_id and j.status == "running"), None)
+                if running_job:
+                    queue.remove(job_id, cancel_running=True)
+                    # Cancel the conversion task
+                    if _current_conversion and not _current_conversion.done():
+                        _current_conversion.cancel()
+                    console.print(f"[yellow]Job {job_id} cancelado e removido.[/yellow]\n")
+                elif queue.remove(job_id):
+                    console.print(f"[green]Job {job_id} removido.[/green]\n")
         elif ch == "6":
             removed = queue.remove_completed()
             console.print(f"[green]{removed} job(s) concluído(s) removido(s).[/green]\n")
