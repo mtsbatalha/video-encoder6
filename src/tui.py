@@ -524,10 +524,10 @@ def show_queue_menu(queue: QueueManager) -> str:
     console.print("  [7] Remover concluídos")
     console.print("  [8] Retentar falhas")
     console.print("  [9] Agendar job")
-    console.print("  [a] Limpar fila")
+    console.print(" [10] Limpar fila")
     console.print("  [0] Voltar\n")
 
-    choices = [str(i) for i in range(10)] + ["a"]
+    choices = [str(i) for i in range(11)]
     return Prompt.ask(
         "Escolha uma opção",
         choices=choices,

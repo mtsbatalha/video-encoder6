@@ -637,7 +637,7 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
                         queue.save()
                         console.print(f"[green]Job agendado para {scheduled_at}.[/green]\n")
                         break
-        elif choice == "a":
+        elif choice == "10":
             if Confirm.ask("Limpar toda a fila?", default=False, console=console):
                 delete_outputs = Confirm.ask(
                     "Remover também os arquivos de saída gerados?",
