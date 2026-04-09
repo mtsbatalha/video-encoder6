@@ -558,18 +558,26 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
             if job_id and queue.move_down(job_id):
                 console.print("[green]Job movido para baixo.[/green]\n")
         elif ch == "5":
-            job_id = prompt_job_id(queue, "remover")
+            job_id = Prompt.ask(
+                "ID do job para remover (pode digitar apenas os primeiros caracteres)",
+                console=console,
+            ).strip()
             if job_id:
-                # Check if job is currently running
-                running_job = next((j for j in queue.jobs if j.id == job_id and j.status == "running"), None)
-                if running_job:
-                    queue.remove(job_id, cancel_running=True)
-                    # Cancel the conversion task
-                    if _current_conversion and not _current_conversion.done():
-                        _current_conversion.cancel()
-                    console.print(f"[yellow]Job {job_id} cancelado e removido.[/yellow]\n")
-                elif queue.remove(job_id):
-                    console.print(f"[green]Job {job_id} removido.[/green]\n")
+                # Find job by exact match or prefix match
+                job = next((j for j in queue.jobs if j.id == job_id), None)
+                if job is None:
+                    job = next((j for j in queue.jobs if j.id.startswith(job_id)), None)
+                if job is None:
+                    console.print(f"[yellow]Job '{job_id}' não encontrado na fila.[/yellow]\n")
+                else:
+                    job_id = job.id  # Use full ID
+                    if job.status == "running":
+                        queue.remove(job_id, cancel_running=True)
+                        if _current_conversion and not _current_conversion.done():
+                            _current_conversion.cancel()
+                        console.print(f"[yellow]Job {job_id} cancelado e removido.[/yellow]\n")
+                    elif queue.remove(job_id):
+                        console.print(f"[green]Job {job_id} removido.[/green]\n")
         elif ch == "6":
             removed = queue.remove_completed()
             console.print(f"[green]{removed} job(s) concluído(s) removido(s).[/green]\n")
