@@ -121,10 +121,39 @@ class _KeyReader:
         return None
 
     def _reader(self):
-        """Background thread: read single chars from stdin with select timeout."""
+        """Background thread: read single chars from stdin with select timeout.
+
+        On Windows, uses msvcrt.kbhit() instead of select (which doesn't
+        work on Windows console handles).
+        """
         _debug_logger.debug("[KeyReader] _reader thread started")
+        _is_win = sys.platform == "win32"
+        if _is_win:
+            try:
+                import msvcrt  # noqa: F401
+            except ImportError:
+                _is_win = False
+                _debug_logger.debug("[KeyReader] msvcrt not available, falling back to select")
         while self._running:
             try:
+                if _is_win:
+                    import msvcrt as _msvcrt
+                    if _msvcrt.kbhit():
+                        ch = _msvcrt.getwch()
+                        if ch in ("\xe0", "\x00"):
+                            _msvcrt.getwch()
+                            continue
+                        if ch in ("\r", "\n"):
+                            continue
+                        if ch not in "0123456789":
+                            continue
+                        _debug_logger.debug("[KeyReader] key captured: '%s'", ch)
+                        with self._lock:
+                            self._key = ch
+                        self._event.set()
+                    else:
+                        time.sleep(0.05)
+                    continue
                 import select as _sel
                 ready, _, _ = _sel.select([sys.stdin], [], [], 0.1)
                 if not ready or not self._running:
