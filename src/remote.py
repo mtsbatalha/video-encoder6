@@ -16,9 +16,14 @@ def _find_executable(name: str) -> str | None:
     return shutil.which(name)
 
 
-def create_temp_dir(prefix: str = "video_encoder_") -> str:
-    """Create and return the path of a temporary directory."""
-    return tempfile.mkdtemp(prefix=prefix)
+def create_temp_dir(prefix: str = "video_encoder_", directory: str | None = None) -> str:
+    """Create and return the path of a temporary directory.
+
+    Args:
+        prefix: Prefix for the directory name.
+        directory: Base directory to create the temp dir in. Defaults to system temp (/tmp on Linux).
+    """
+    return tempfile.mkdtemp(prefix=prefix, dir=directory)
 
 
 def cleanup_temp_dir(path: str) -> bool:

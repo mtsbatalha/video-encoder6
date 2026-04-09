@@ -123,7 +123,7 @@ async def convert_single_file(config: dict, queue: QueueManager) -> None:
         if not remote_path:
             return
 
-        temp_dir = create_temp_dir()
+        temp_dir = create_temp_dir(directory=config.get("temp_dir"))
         console.print(f"\n[dim]Copiando para: {temp_dir}[/dim]\n")
 
         def _copy_progress(line: str):
@@ -215,7 +215,7 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
         if not remote_path:
             return
 
-        temp_dir = create_temp_dir()
+        temp_dir = create_temp_dir(directory=config.get("temp_dir"))
         console.print(f"\n[dim]Copiando para: {temp_dir}[/dim]\n")
 
         def _copy_progress(line: str):
@@ -496,7 +496,7 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
         return _queue_task is not None and not _queue_task.done()
 
     def _handle_command(ch: str) -> None:
-        nonlocal _queue_task
+        global _queue_task
         if ch == "1":
             if _queue_task and not _queue_task.done():
                 console.print("[yellow]Fila já está sendo processada em segundo plano.[/yellow]\n")
