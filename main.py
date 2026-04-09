@@ -3,6 +3,8 @@
 import asyncio
 import json
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -527,14 +529,64 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
             if Confirm.ask("Limpar toda a fila?", default=False, console=console):
                 queue.clear_all()
                 console.print("[green]Fila limpa.[/green]\n")
-                        j.status = "scheduled"
-                        queue.save()
-                        console.print(f"[green]Job agendado para {scheduled_at}.[/green]\n")
-                        break
-        elif choice == "9":
-            if Confirm.ask("Limpar toda a fila?", default=False, console=console):
-                queue.clear_all()
-                console.print("[green]Fila limpa.[/green]\n")
+
+
+async def kill_ffmpeg_processes() -> None:
+    """Force kill all running ffmpeg processes."""
+    console.print("[bold]Encerrando processos FFmpeg...[/bold]\n")
+
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["taskkill", "/F", "/IM", "ffmpeg.exe"],
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            output = result.stdout
+        else:
+            result = subprocess.run(
+                ["pkill", "-9", "ffmpeg"],
+                capture_output=True,
+                text=True,
+            )
+            output = result.stdout + result.stderr
+
+        lines = [l for l in output.strip().split("\n") if l]
+        killed = 0
+        for line in lines:
+            if "SUCCESS" in line.upper() or "killed" in line.lower():
+                killed += 1
+
+        # Count how many were killed
+        if sys.platform == "win32":
+            # taskkill output like: "SUCCESS: The process with PID 1234 has been terminated."
+            killed = sum(1 for l in lines if "SUCCESS" in l.upper())
+        else:
+            # pkill returns nothing on success, count from stderr
+            killed = len([l for l in lines if l])
+
+        if killed > 0:
+            console.print(f"[green]{killed} processo(s) FFmpeg encerrado(s).[/green]")
+        else:
+            console.print("[yellow]Nenhum processo FFmpeg encontrado.[/yellow]")
+
+        # Also cancel background queue task
+        global _queue_task
+        if _queue_task and not _queue_task.done():
+            _queue_task.cancel()
+            try:
+                await _queue_task
+            except asyncio.CancelledError:
+                pass
+            console.print("[dim]Processamento de fila cancelado.[/dim]")
+
+    except FileNotFoundError:
+        console.print("[red]Comando não encontrado.[/red]")
+    except Exception as e:
+        console.print(f"[red]Erro: {e}[/red]")
+
+    console.print()
 
 
 async def settings_menu(config: dict) -> None:
@@ -608,6 +660,11 @@ async def settings_menu(config: dict) -> None:
 
     save_config(config)
     console.print("\n[green]Configurações salvas.[/green]")
+
+    # Maintenance option
+    console.print()
+    if Confirm.ask("Encerrar todos os processos FFmpeg em execução?", default=False, console=console):
+        await kill_ffmpeg_processes()
 
 
 async def main() -> None:
