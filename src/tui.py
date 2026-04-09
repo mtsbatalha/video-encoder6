@@ -65,7 +65,8 @@ def _check_keyboard_input() -> str | None:
 class _KeyReader:
     """Persistent background key reader using stdin in a daemon thread.
 
-    More reliable than msvcrt.kbhit() inside Rich Live on Windows.
+    Uses select() with short timeout so stop() is responsive and doesn't
+    consume characters typed after stop() was called.
     """
 
     def __init__(self):
@@ -85,9 +86,66 @@ class _KeyReader:
         self._thread.start()
 
     def stop(self):
-        """Stop the background reader thread."""
+        """Stop the background reader thread and discard any pending key."""
         _debug_logger.debug("[KeyReader] stop — setting _running=False")
         self._running = False
+        # Discard any key that may have been buffered — prevents stealing
+        # from Prompt.ask / Confirm.ask that follow the stop() call.
+        with self._lock:
+            self._key = None
+            self._event.clear()
+        # Wait for thread to actually exit (select timeout ≤ 100ms).
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+            if self._thread.is_alive():
+                _debug_logger.warning("[KeyReader] thread did not exit after stop()")
+        # After thread has exited, stdin is safe to use for prompts.
+        # Wait for thread to actually exit (it will notice _running at the
+        # next select timeout, max 100ms away).
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+            if self._thread.is_alive():
+                _debug_logger.warning("[KeyReader] thread did not exit after stop()")
+
+    def get_key(self, timeout: float = 0.15) -> str | None:
+        """Wait up to *timeout* seconds for a key, then return it (or None)."""
+        if not self._running or not self._thread:
+            return None
+        if self._event.wait(timeout=timeout):
+            self._event.clear()
+            with self._lock:
+                key = self._key
+                self._key = None
+            _debug_logger.debug("[KeyReader] get_key returning: '%s'", key)
+            return key
+        return None
+
+    def _reader(self):
+        """Background thread: read single chars from stdin with select timeout."""
+        _debug_logger.debug("[KeyReader] _reader thread started")
+        while self._running:
+            try:
+                import select as _sel
+                ready, _, _ = _sel.select([sys.stdin], [], [], 0.1)
+                if not ready or not self._running:
+                    continue
+                ch = sys.stdin.read(1)
+            except Exception as e:
+                _debug_logger.debug("[KeyReader] read exception: %s", e)
+                break
+            if not ch or not self._running:
+                _debug_logger.debug("[KeyReader] empty read or stopped, ch=%r running=%s", ch, self._running)
+                break
+            if ch in ("\xe0", "\x00"):
+                # Extended key — consume second byte
+                sys.stdin.read(1)
+                continue
+            if ch in ("\r", "\n"):
+                continue
+            # Only accept recognized command keys
+            if ch not in "0123456789":
+                continue
+            _debug_logger.debug("[KeyReader] key captured: '%s'", ch)
 
     def get_key(self, timeout: float = 0.15) -> str | None:
         """Wait up to *timeout* seconds for a key, then return it (or None)."""
@@ -609,7 +667,6 @@ def interactive_queue_menu(
                         _debug_logger.debug("[QueueMenu] command '%s' received", ch)
                         if ch in PROMPT_COMMANDS:
                             _debug_logger.debug("[QueueMenu] prompt command '%s' — stopping key_reader + live", ch)
-                            # Stop key reader so it doesn't steal stdin from Prompt.ask
                             key_reader.stop()
                             live.stop()
                             try:
@@ -624,7 +681,6 @@ def interactive_queue_menu(
                                 _debug_logger.debug("[QueueMenu] live + key_reader restarted")
                         else:
                             _debug_logger.debug("[QueueMenu] instant command '%s' — calling on_command", ch)
-                            on_command(ch)
                             on_command(ch)
                         _last_rendered = None  # Force refresh after command
             except KeyboardInterrupt:
