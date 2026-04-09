@@ -80,20 +80,16 @@ def _parse_time_ms(time_str: str) -> float | None:
 
 
 def _inject_progress_flag(cmd: list[str], progress_file: str) -> list[str]:
-    """Insert -progress flag before -y/-output in the command."""
+    """Insert -progress <file> flag before -y or the output path."""
     new_cmd = list(cmd)
-    # Find where -y or the output path is
     for i, arg in enumerate(new_cmd):
         if arg == "-y":
-            new_cmd.insert(i, progress_file)
-            new_cmd.insert(i, "pipe:1")
             new_cmd.insert(i, "-progress")
-            break
-    else:
-        # No -y found, append before last arg (output path)
-        new_cmd.insert(-1, progress_file)
-        new_cmd.insert(-1, "pipe:1")
-        new_cmd.insert(-1, "-progress")
+            new_cmd.insert(i + 1, progress_file)
+            return new_cmd
+    # No -y found, insert before the last arg (output path)
+    new_cmd.insert(-1, "-progress")
+    new_cmd.insert(-1, progress_file)
     return new_cmd
 
 
