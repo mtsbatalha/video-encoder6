@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -55,6 +56,15 @@ _queue_task: asyncio.Task | None = None
 _current_conversion: asyncio.Task | None = None
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+# Debug logger for main.py
+_main_debug_logger = logging.getLogger("main_debug")
+if not _main_debug_logger.handlers:
+    _main_debug_logger.setLevel(logging.DEBUG)
+    _log_file = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug.log"))
+    _fh = logging.FileHandler(_log_file, mode="a", encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-5s  %(message)s"))
+    _main_debug_logger.addHandler(_fh)
 
 
 def resolve_output_path(output_path: str, policy: str) -> str | None:
@@ -537,6 +547,8 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
 
     def _handle_command(ch: str) -> None:
         global _queue_task, _current_conversion
+        _main_debug_logger.info("[_handle_command] ch='%s' | queue.jobs=%s | running=%d",
+                                ch, [j.id for j in queue.jobs], queue.running_count)
         if ch == "1":
             if _queue_task and not _queue_task.done():
                 console.print("[yellow]Fila já está sendo processada em segundo plano.[/yellow]\n")
@@ -548,9 +560,11 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
         elif ch == "2":
             new_state = queue.toggle_pause()
             state = "pausada" if new_state else "retomada"
+            _main_debug_logger.info("[_handle_command] command 2: toggle_pause -> %s", state)
             console.print(f"[green]Fila {state}.[/green]\n")
         elif ch == "3":
             job_id = prompt_job_id(queue, "mover para cima")
+            _main_debug_logger.info("[_handle_command] command 3: prompt_job_id=%s", job_id)
             if job_id and queue.move_up(job_id):
                 console.print("[green]Job movido para cima.[/green]\n")
         elif ch == "4":
@@ -558,25 +572,33 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
             if job_id and queue.move_down(job_id):
                 console.print("[green]Job movido para baixo.[/green]\n")
         elif ch == "5":
+            _main_debug_logger.info("[_handle_command] command 5: remove job — prompting for ID")
             job_id = Prompt.ask(
                 "ID do job para remover (pode digitar apenas os primeiros caracteres)",
                 console=console,
             ).strip()
+            _main_debug_logger.info("[_handle_command] command 5: user input job_id='%s'", job_id)
             if job_id:
                 # Find job by exact match or prefix match
                 job = next((j for j in queue.jobs if j.id == job_id), None)
+                _main_debug_logger.info("[_handle_command] command 5: exact match=%s", job.id if job else "None")
                 if job is None:
                     job = next((j for j in queue.jobs if j.id.startswith(job_id)), None)
+                    _main_debug_logger.info("[_handle_command] command 5: prefix match=%s", job.id if job else "None")
                 if job is None:
+                    _main_debug_logger.warning("[_handle_command] command 5: job NOT found for input '%s'", job_id)
                     console.print(f"[yellow]Job '{job_id}' não encontrado na fila.[/yellow]\n")
                 else:
                     job_id = job.id  # Use full ID
+                    _main_debug_logger.info("[_handle_command] command 5: found job %s status='%s'", job_id, job.status)
                     if job.status == "running":
+                        _main_debug_logger.info("[_handle_command] command 5: cancelling running job")
                         queue.remove(job_id, cancel_running=True)
                         if _current_conversion and not _current_conversion.done():
                             _current_conversion.cancel()
                         console.print(f"[yellow]Job {job_id} cancelado e removido.[/yellow]\n")
                     elif queue.remove(job_id):
+                        _main_debug_logger.info("[_handle_command] command 5: removed job %s", job_id)
                         console.print(f"[green]Job {job_id} removido.[/green]\n")
         elif ch == "6":
             removed = queue.remove_completed()
@@ -599,6 +621,7 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
                         console.print(f"[green]Job agendado para {scheduled_at}.[/green]\n")
                         break
         elif ch == "9":
+            _main_debug_logger.info("[_handle_command] command 9: clear queue — asking confirmation")
             if Confirm.ask("Limpar toda a fila?", default=False, console=console):
                 delete_outputs = Confirm.ask(
                     "Remover também os arquivos de saída gerados?",
@@ -606,7 +629,9 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
                     console=console,
                 )
                 temp_dir = config["temp_dir"] if config.get("temp_dir_enabled") else None
+                _main_debug_logger.info("[_handle_command] command 9: clearing delete_outputs=%s", delete_outputs)
                 deleted = queue.clear_all(delete_outputs=delete_outputs, temp_dir=temp_dir)
+                _main_debug_logger.info("[_handle_command] command 9: deleted %d files", deleted)
                 console.print("[green]Fila limpa.[/green]\n")
 
     exited = interactive_queue_menu(queue, _has_bg_task, _handle_command)

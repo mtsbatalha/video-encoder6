@@ -1,5 +1,6 @@
 """Rich-based TUI components for the video encoder."""
 
+import logging
 import os
 import sys
 import threading
@@ -26,6 +27,16 @@ from src.profiles import ConversionProfile
 from src.queue_manager import QueueManager, QueueJob
 
 console = Console()
+
+# Debug logger — writes all queue menu activity to debug.log
+_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+_debug_file = os.path.normpath(os.path.join(_log_dir, "debug.log"))
+_debug_logger = logging.getLogger("tui_debug")
+if not _debug_logger.handlers:
+    _debug_logger.setLevel(logging.DEBUG)
+    _fh = logging.FileHandler(_debug_file, mode="a", encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-5s  %(message)s"))
+    _debug_logger.addHandler(_fh)
 
 
 def _check_keyboard_input() -> str | None:
@@ -69,11 +80,13 @@ class _KeyReader:
         if self._running:
             return
         self._running = True
+        _debug_logger.debug("[KeyReader] start — thread launching")
         self._thread = threading.Thread(target=self._reader, daemon=True)
         self._thread.start()
 
     def stop(self):
         """Stop the background reader thread."""
+        _debug_logger.debug("[KeyReader] stop — setting _running=False")
         self._running = False
 
     def get_key(self, timeout: float = 0.15) -> str | None:
@@ -85,17 +98,21 @@ class _KeyReader:
             with self._lock:
                 key = self._key
                 self._key = None
+            _debug_logger.debug("[KeyReader] get_key returning: '%s'", key)
             return key
         return None
 
     def _reader(self):
         """Background thread: continuously read single chars from stdin."""
+        _debug_logger.debug("[KeyReader] _reader thread started")
         while self._running:
             try:
                 ch = sys.stdin.read(1)
-            except Exception:
+            except Exception as e:
+                _debug_logger.debug("[KeyReader] read exception: %s", e)
                 break
             if not ch or not self._running:
+                _debug_logger.debug("[KeyReader] empty read or stopped, ch=%r running=%s", ch, self._running)
                 break
             if ch in ("\xe0", "\x00"):
                 # Extended key — consume second byte
@@ -106,6 +123,7 @@ class _KeyReader:
             # Only accept recognized command keys
             if ch not in "0123456789":
                 continue
+            _debug_logger.debug("[KeyReader] key captured: '%s'", ch)
             with self._lock:
                 self._key = ch
             self._event.set()
@@ -585,18 +603,28 @@ def interactive_queue_menu(
 
                     # Process command
                     if ch == "0":
+                        _debug_logger.debug("[QueueMenu] command '0' — exit menu")
                         return True
                     elif ch in "123456789":
+                        _debug_logger.debug("[QueueMenu] command '%s' received", ch)
                         if ch in PROMPT_COMMANDS:
+                            _debug_logger.debug("[QueueMenu] prompt command '%s' — stopping key_reader + live", ch)
                             # Stop key reader so it doesn't steal stdin from Prompt.ask
                             key_reader.stop()
                             live.stop()
                             try:
+                                _debug_logger.debug("[QueueMenu] calling on_command('%s')", ch)
                                 on_command(ch)
+                                _debug_logger.debug("[QueueMenu] on_command('%s') returned", ch)
+                            except Exception as e:
+                                _debug_logger.error("[QueueMenu] on_command('%s') exception: %s", ch, e, exc_info=True)
                             finally:
                                 live.start()
                                 key_reader.start()
+                                _debug_logger.debug("[QueueMenu] live + key_reader restarted")
                         else:
+                            _debug_logger.debug("[QueueMenu] instant command '%s' — calling on_command", ch)
+                            on_command(ch)
                             on_command(ch)
                         _last_rendered = None  # Force refresh after command
             except KeyboardInterrupt:
