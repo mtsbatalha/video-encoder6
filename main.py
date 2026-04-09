@@ -152,12 +152,14 @@ async def convert_batch(config: dict) -> None:
     console.print(f"[dim]Parallelismo: {max_parallel} conversão(ões) simultâneas[/dim]\n")
 
     with create_progress() as progress:
-        # Create all tasks upfront
+        # Create all tasks as "queued" (spinner not shown yet)
         task_ids = {}
         for f in files:
-            task_ids[f] = add_conversion_task(progress, Path(f).name)
+            task_ids[f] = add_conversion_task(progress, Path(f).name, start=False)
 
-        def _cb(filename: str, pct: int, speed: str) -> None:
+        def _cb(filename: str, pct: int, speed: str, just_started: bool = False) -> None:
+            if filename in task_ids and just_started:
+                progress.start_task(task_ids[filename])
             if filename in task_ids:
                 update_progress(progress, task_ids[filename], pct, speed)
 

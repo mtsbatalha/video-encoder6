@@ -51,6 +51,17 @@ class ProgressState:
             if key in self._data:
                 self._data[key] = {"pct": 100, "speed": "Concluído"}
 
+    def mark_started(self, key: str) -> None:
+        with self._lock:
+            if key not in self._data:
+                self._data[key] = {"pct": 0, "speed": "", "started": True}
+            else:
+                self._data[key]["started"] = True
+
+    def get_started_keys(self) -> set[str]:
+        with self._lock:
+            return {k for k, v in self._data.items() if v.get("started")}
+
 
 def _get_duration(input_path: str) -> float | None:
     """Get video duration in seconds using ffprobe."""
@@ -143,6 +154,9 @@ def _run_ffmpeg_worker(
             stderr=subprocess.PIPE,
             creationflags=creation_flags,
         )
+
+        # Signal that this conversion has started
+        progress.mark_started(input_path)
 
         stderr_lines: list[str] = []
 
@@ -251,7 +265,7 @@ async def run_conversion(
 async def run_batch_conversions(
     jobs: list[dict],
     max_parallel: int = 2,
-    progress_callback: Callable[[str, int, str], None] | None = None,
+    progress_callback: Callable[[str, int, str, bool], None] | None = None,
 ) -> list[ConversionResult]:
     """Run batch conversions with real-time progress polling from main thread.
 
@@ -277,6 +291,7 @@ async def run_batch_conversions(
             futures[future] = job["input_path"]
 
         # Main thread: poll progress state and call callback
+        known_started: set[str] = set()
         all_done = False
         while not all_done:
             await asyncio.sleep(0.2)  # Yield to event loop for Rich Progress refresh
@@ -285,7 +300,10 @@ async def run_batch_conversions(
                 if key in path_to_idx:
                     idx = path_to_idx[key]
                     if results[idx] is None and progress_callback:
-                        progress_callback(key, state["pct"], state["speed"])
+                        just_started = key not in known_started
+                        if just_started:
+                            known_started.add(key)
+                        progress_callback(key, state["pct"], state["speed"], just_started)
 
             all_done = all(f.done() for f in futures)
 

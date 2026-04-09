@@ -133,7 +133,7 @@ def create_progress() -> Progress:
         BarColumn(bar_width=40),
         TextColumn("[bold]{task.percentage:>3.0f}%"),
         TextColumn("[dim]|[dim]"),
-        TextColumn("[cyan]{task.fields[speed]}"),
+        TextColumn("[cyan]{task.fields[ff_speed]}"),
         TimeElapsedColumn(),
         TimeRemainingColumn(),
         console=console,
@@ -142,21 +142,26 @@ def create_progress() -> Progress:
 
 
 def add_conversion_task(
-    progress: Progress, filename: str, total: int = 100
+    progress: Progress, filename: str, total: int = 100, start: bool = True
 ) -> TaskID:
     """Add a conversion task to the progress tracker."""
     return progress.add_task(
         f"[white]{filename}",
         total=total,
-        speed="",
+        ff_speed="",
+        start=start,
     )
 
 
 def update_progress(
     progress: Progress, task_id: TaskID, completed: int, speed: str = ""
 ) -> None:
-    """Update a conversion task's progress."""
-    progress.update(task_id, completed=completed, speed=speed)
+    """Update a conversion task's progress.
+
+    Updates 'completed' (letting Rich auto-calculate speed for ETA)
+    and stores FFmpeg speed as a custom field 'ff_speed' for display.
+    """
+    progress.update(task_id, completed=completed, ff_speed=speed)
 
 
 def print_results(results: list[dict]) -> None:
