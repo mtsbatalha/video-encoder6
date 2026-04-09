@@ -86,22 +86,25 @@ class _KeyReader:
         self._thread.start()
 
     def stop(self):
-        """Stop the background reader thread and discard any pending key."""
+        """Stop the background reader thread and make stdin safe for prompts."""
         _debug_logger.debug("[KeyReader] stop — setting _running=False")
         self._running = False
-        # Discard any key that may have been buffered — prevents stealing
-        # from Prompt.ask / Confirm.ask that follow the stop() call.
+        # Discard any key that may have been buffered.
         with self._lock:
             self._key = None
             self._event.clear()
+        # On Linux, drain any pending stdin immediately to prevent
+        # race with user typing confirmation for Prompt.ask/Confirm.ask.
+        if sys.platform != "win32":
+            import select as _sel
+            try:
+                ready, _, _ = _sel.select([sys.stdin], [], [], 0.01)
+                if ready:
+                    drained = sys.stdin.read(4096)
+                    _debug_logger.debug("[KeyReader] stop — drained stdin: %r", drained)
+            except Exception:
+                pass
         # Wait for thread to actually exit (select timeout ≤ 100ms).
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=0.5)
-            if self._thread.is_alive():
-                _debug_logger.warning("[KeyReader] thread did not exit after stop()")
-        # After thread has exited, stdin is safe to use for prompts.
-        # Wait for thread to actually exit (it will notice _running at the
-        # next select timeout, max 100ms away).
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=0.5)
             if self._thread.is_alive():
@@ -175,45 +178,6 @@ class _KeyReader:
             if ch not in "0123456789":
                 continue
             _debug_logger.debug("[KeyReader] key captured: '%s'", ch)
-
-    def get_key(self, timeout: float = 0.15) -> str | None:
-        """Wait up to *timeout* seconds for a key, then return it (or None)."""
-        if not self._running or not self._thread:
-            return None
-        if self._event.wait(timeout=timeout):
-            self._event.clear()
-            with self._lock:
-                key = self._key
-                self._key = None
-            _debug_logger.debug("[KeyReader] get_key returning: '%s'", key)
-            return key
-        return None
-
-    def _reader(self):
-        """Background thread: continuously read single chars from stdin."""
-        _debug_logger.debug("[KeyReader] _reader thread started")
-        while self._running:
-            try:
-                ch = sys.stdin.read(1)
-            except Exception as e:
-                _debug_logger.debug("[KeyReader] read exception: %s", e)
-                break
-            if not ch or not self._running:
-                _debug_logger.debug("[KeyReader] empty read or stopped, ch=%r running=%s", ch, self._running)
-                break
-            if ch in ("\xe0", "\x00"):
-                # Extended key — consume second byte
-                sys.stdin.read(1)
-                continue
-            if ch in ("\r", "\n"):
-                continue
-            # Only accept recognized command keys
-            if ch not in "0123456789":
-                continue
-            _debug_logger.debug("[KeyReader] key captured: '%s'", ch)
-            with self._lock:
-                self._key = ch
-            self._event.set()
 
 
 def show_banner() -> None:
@@ -660,44 +624,91 @@ def interactive_queue_menu(
 ) -> bool:
     """Show queue management menu with real-time updates via rich.Live.
 
-    Uses a persistent background thread reading from sys.stdin for
-    reliable key detection inside Rich Live on Windows.
+    Uses raw terminal mode on Linux (tty) for non-blocking key capture
+    in the main loop — no background thread, so Prompt.ask/Confirm.ask
+    never compete for stdin. On Windows, uses msvcrt.kbhit().
 
     Returns True if the user chose to exit (0), False otherwise.
     """
     PROMPT_COMMANDS = set("34589")
+    _is_win = sys.platform == "win32"
+    if _is_win:
+        try:
+            import msvcrt  # noqa: F401
+        except ImportError:
+            _is_win = False
+
+    def _read_key() -> str | None:
+        """Non-blocking read of a single command key (0-9) from stdin."""
+        if _is_win:
+            import msvcrt as _ms
+            if _ms.kbhit():
+                ch = _ms.getwch()
+                if ch in ("\xe0", "\x00"):
+                    _ms.getwch()  # consume extended byte
+                    return None
+                if ch in ("\r", "\n"):
+                    return None
+                return ch if ch in "0123456789" else None
+            return None
+        # Linux: stdin is in raw mode, select with short timeout
+        import select as _sel
+        try:
+            ready, _, _ = _sel.select([sys.stdin], [], [], 0.05)
+            if ready:
+                ch = sys.stdin.read(1)
+                if ch in ("\xe0", "\x00"):
+                    sys.stdin.read(1)
+                    return None
+                if ch in ("\r", "\n"):
+                    return None
+                return ch if ch in "0123456789" else None
+        except Exception:
+            pass
+        return None
 
     def _make_panel() -> Panel:
         return _render_queue_panel(queue, has_bg_task(), paused_override)
 
-    key_reader = _KeyReader()
-    key_reader.start()
+    # On Linux, use raw terminal mode for non-blocking character input
+    _saved_termios = None
+    _fd = sys.stdin.fileno()
+    if not _is_win:
+        try:
+            import termios
+            import tty as _tty
+            _saved_termios = termios.tcgetattr(_fd)
+            _tty.setraw(_fd)
+        except Exception:
+            _saved_termios = None
+
+    _last_rendered = None
     try:
-        _last_rendered = None
         with Live(_make_panel(), console=console, refresh_per_second=1, screen=False) as live:
             try:
                 while True:
                     panel = _make_panel()
-                    # Only update when content actually changed to prevent flickering
                     panel_text = str(panel)
                     if panel_text != _last_rendered:
                         _last_rendered = panel_text
                         live.update(panel, refresh=True)
 
-                    ch = key_reader.get_key(timeout=0.5)
+                    ch = _read_key()
                     if ch is None:
                         continue
 
-                    # Process command
                     if ch == "0":
                         _debug_logger.debug("[QueueMenu] command '0' — exit menu")
                         return True
                     elif ch in "123456789":
                         _debug_logger.debug("[QueueMenu] command '%s' received", ch)
                         if ch in PROMPT_COMMANDS:
-                            _debug_logger.debug("[QueueMenu] prompt command '%s' — stopping key_reader + live", ch)
-                            key_reader.stop()
+                            _debug_logger.debug("[QueueMenu] prompt command '%s' — stopping live + restoring terminal", ch)
                             live.stop()
+                            # Restore terminal to cooked mode for Prompt.ask/Confirm.ask
+                            if _saved_termios:
+                                import termios as _tc
+                                termios.tcsetattr(_fd, termios.TCSADRAIN, _saved_termios)
                             try:
                                 _debug_logger.debug("[QueueMenu] calling on_command('%s')", ch)
                                 on_command(ch)
@@ -705,9 +716,12 @@ def interactive_queue_menu(
                             except Exception as e:
                                 _debug_logger.error("[QueueMenu] on_command('%s') exception: %s", ch, e, exc_info=True)
                             finally:
+                                # Restore raw mode
+                                if _saved_termios:
+                                    import tty as _tty
+                                    _tty.setraw(_fd)
                                 live.start()
-                                key_reader.start()
-                                _debug_logger.debug("[QueueMenu] live + key_reader restarted")
+                                _debug_logger.debug("[QueueMenu] live restarted (raw mode restored)")
                         else:
                             _debug_logger.debug("[QueueMenu] instant command '%s' — calling on_command", ch)
                             on_command(ch)
@@ -715,7 +729,14 @@ def interactive_queue_menu(
             except KeyboardInterrupt:
                 return False
     finally:
-        key_reader.stop()
+        # Restore terminal settings
+        if _saved_termios is not None:
+            try:
+                import termios as _tc
+                termios.tcsetattr(_fd, termios.TCSADRAIN, _saved_termios)
+                _debug_logger.debug("[QueueMenu] terminal settings restored")
+            except Exception:
+                pass
 
 
 def prompt_job_id(queue: QueueManager, action: str) -> str | None:
