@@ -39,7 +39,7 @@ from src.tui import (
     show_main_menu,
     show_others_menu,
     show_queue_menu,
-    watch_queue_live,
+    watch_queue_with_processing,
     prompt_job_id,
     update_progress,
     prompt_source_type,
@@ -576,18 +576,26 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
         if choice == "0":
             return
         elif choice == "1":
-            # Ver fila — real-time read-only viewer
-            await watch_queue_live(queue)
+            # Ver fila (tempo real) — inicia processamento e entra no live viewer
+            def _start_task(c, q):
+                global _queue_task
+                _queue_task = asyncio.create_task(process_queue(c, q))
+                return _queue_task
+            _task_state = {
+                "task": _queue_task,
+                "current": _current_conversion,
+                "start_fn": _start_task,
+            }
+            await watch_queue_with_processing(queue, config, _task_state)
         elif choice == "2":
+            # Processar fila — cria task em background e volta ao menu
             if _queue_task and not _queue_task.done():
                 console.print("[yellow]Fila já está sendo processada em segundo plano.[/yellow]\n")
             elif queue.pending_count == 0 and queue.scheduled_count == 0:
                 console.print("[yellow]Nenhum job pendente ou agendado na fila.[/yellow]\n")
             else:
                 _queue_task = asyncio.create_task(process_queue(config, queue))
-                # Yield immediately so the background task can start
-                await asyncio.sleep(0)
-                console.print("[green]Processamento iniciado![/green]\n")
+                console.print("[green]Processamento iniciado em segundo plano![/green]\n")
         elif choice == "3":
             new_state = queue.toggle_pause()
             state = "pausada" if new_state else "retomada"

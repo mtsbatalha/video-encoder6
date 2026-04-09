@@ -706,6 +706,263 @@ async def watch_queue_live(queue: QueueManager) -> None:
                 pass
 
 
+async def watch_queue_with_processing(
+    queue: QueueManager,
+    config: dict | None = None,
+    task_state: dict | None = None,
+) -> None:
+    """Start queue processing (if not already running) and enter live monitoring mode.
+
+    Replaces the blocking menu with a live-updating table that shows progress
+    in real-time. Uses non-blocking keyboard input so the background task can run.
+
+    Commands: p=pausar/retomar, x=cancelar, q/0=sair
+
+    task_state: optional dict with keys:
+        - 'task': asyncio.Task | None  (the queue processing task)
+        - 'current': asyncio.Task | None  (the current conversion task)
+        - 'start_fn': callable that takes (config, queue) and returns a Task
+        - 'process_queue_fn': the process_queue async function
+    """
+    import asyncio as _asyncio
+
+    _is_win = sys.platform == "win32"
+    if _is_win:
+        try:
+            import msvcrt  # noqa: F401
+        except ImportError:
+            _is_win = False
+
+    def _read_key() -> str | None:
+        if _is_win:
+            import msvcrt as _ms
+            if _ms.kbhit():
+                ch = _ms.getwch()
+                if ch in ("\xe0", "\x00"):
+                    _ms.getwch()
+                    return None
+                if ch in ("\r", "\n"):
+                    return None
+                return ch
+            return None
+        import select as _sel
+        try:
+            ready, _, _ = _sel.select([sys.stdin], [], [], 0.05)
+            if ready:
+                ch = sys.stdin.read(1)
+                if ch in ("\xe0", "\x00"):
+                    sys.stdin.read(1)
+                    return None
+                if ch in ("\r", "\n"):
+                    return None
+                return ch
+        except Exception:
+            pass
+        return None
+
+    # Use passed state dict for task management
+    if task_state is None:
+        task_state = {}
+
+    # Start the queue task if not already running
+    _qtask = task_state.get("task")
+    if not _qtask or _qtask.done():
+        start_fn = task_state.get("start_fn")
+        if start_fn:
+            _qtask = start_fn(config, queue)
+            task_state["task"] = _qtask
+            # Yield so the task can start immediately
+            await _asyncio.sleep(0)
+        elif queue.pending_count > 0 or queue.scheduled_count > 0:
+            # Fallback: direct creation
+            process_fn = task_state.get("process_queue_fn")
+            if process_fn:
+                _qtask = _asyncio.create_task(process_fn(config, queue))
+                task_state["task"] = _qtask
+                await _asyncio.sleep(0)
+            else:
+                console.print("[yellow]Nenhum processador disponível.[/yellow]\n")
+                return
+        else:
+            console.print("[yellow]Nenhum job pendente ou agendado na fila.[/yellow]\n")
+            return
+
+    _saved_termios = None
+    _fd = sys.stdin.fileno()
+    if not _is_win:
+        try:
+            import termios
+            import tty as _tty
+            _saved_termios = termios.tcgetattr(_fd)
+            _tty.setraw(_fd)
+        except Exception:
+            _saved_termios = None
+
+    _last_rendered = None
+    _task_was_running = True
+    try:
+        while True:
+            stats = queue.get_stats()
+            is_paused = stats["paused"]
+            status_tag = "[red]PAUSADA[/red]" if is_paused else "[green]ATIVA[/green]"
+            _qtask = task_state.get("task")
+            task_active = _qtask and not _qtask.done()
+
+            if not task_active:
+                _task_was_running = False
+
+            lines = [
+                f"Estado: {status_tag}  |  "
+                f"Pendentes: [yellow]{stats['pending']}[/yellow]  "
+                f"Rodando: [blue]{stats['running']}[/blue]  "
+                f"Concluídas: [green]{stats['completed']}[/green]  "
+                f"Falhas: [red]{stats['failed']}[/red]  "
+                f"Agendadas: [cyan]{stats['scheduled']}[/cyan]",
+            ]
+
+            running_job = next((j for j in queue.jobs if j.status == "running"), None)
+            if running_job:
+                lines.append(
+                    f"[bold green]Convertendo: {Path(running_job.input_path).name} "
+                    f"({running_job.progress_pct}%)  |  {running_job.speed or ''}[/bold green]"
+                )
+
+            if not task_active and _task_was_running:
+                lines.append("[green][PROCESSAMENTO CONCLUÍDO][/green]")
+
+            table = Table(show_header=True, header_style="bold cyan", border_style="dim", padding=(0, 0))
+            table.add_column("#", style="yellow", width=3)
+            table.add_column("ID", style="dim", width=10)
+            table.add_column("Arquivo", style="white")
+            table.add_column("Perfil", style="cyan", width=12)
+            table.add_column("Progresso", style="white", width=10)
+            table.add_column("Velocidade", style="dim", width=10)
+            table.add_column("Status", style="white", width=12)
+
+            pending_idx = 0
+            for j in queue.jobs:
+                pending_idx += 1
+                status_map = {
+                    "pending": "[yellow]Pendente[/yellow]",
+                    "running": "[blue]Rodando[/blue]",
+                    "completed": "[green]Concluído[/green]",
+                    "failed": "[red]Falha[/red]",
+                    "paused": "[magenta]Pausado[/magenta]",
+                    "scheduled": "[cyan]Agendado[/cyan]",
+                }
+                status_text = status_map.get(j.status, j.status)
+
+                if j.status == "completed":
+                    progress_bar = "[green]██████████[/green] 100%"
+                elif j.status == "failed":
+                    progress_bar = "[red]Falha[/red]"
+                elif j.progress_pct > 0:
+                    filled = j.progress_pct // 10
+                    empty = 10 - filled
+                    progress_bar = f"[yellow]{'█' * filled}{'░' * empty}[/yellow] {j.progress_pct}%"
+                else:
+                    progress_bar = "[dim]░░░░░░░░░░ 0%[/dim]"
+
+                speed_text = j.speed or ""
+                filename = Path(j.input_path).name
+
+                table.add_row(
+                    str(pending_idx),
+                    j.id,
+                    filename,
+                    j.profile_name[:12] if j.profile_name else "",
+                    progress_bar,
+                    speed_text,
+                    status_text,
+                )
+
+            from rich import box
+            from rich.console import Group
+            if task_active:
+                footer = "[dim]p=pausar  x=cancelar  q/0=sair[/dim]"
+            else:
+                footer = "[dim]Pressione qualquer tecla para voltar...[/dim]"
+
+            if queue.jobs:
+                panel = Panel(
+                    Group(
+                        Text.from_markup("\n".join(lines) + "\n"),
+                        table,
+                        Text.from_markup(footer),
+                    ),
+                    title="[bold]Fila de Conversão (ao vivo)[/bold]",
+                    border_style="cyan",
+                    box=box.ROUNDED,
+                )
+            else:
+                lines.append("[dim]  (fila vazia)[/dim]")
+                lines.append(footer)
+                panel = Panel(
+                    Text.from_markup("\n".join(lines)),
+                    title="[bold]Fila de Conversão (ao vivo)[/bold]",
+                    border_style="cyan",
+                    box=box.ROUNDED,
+                )
+
+            panel_text = str(panel)
+            if panel_text != _last_rendered:
+                _last_rendered = panel_text
+                console.clear()
+                console.print(panel)
+
+            ch = _read_key()
+            if ch is not None:
+                if ch == 'p' and task_active:
+                    queue.toggle_pause()
+                elif ch == 'x' and task_active:
+                    _conv = task_state.get("current")
+                    if _conv and not _conv.done():
+                        _conv.cancel()
+                    _qtask = task_state.get("task")
+                    if _qtask and not _qtask.done():
+                        _qtask.cancel()
+                    console.print("[yellow]Processamento cancelado.[/yellow]\n")
+                    return
+                elif ch in ('q', '0'):
+                    _qtask = task_state.get("task")
+                    if _qtask and not _qtask.done():
+                        _qtask.cancel()
+                    return
+                else:
+                    _qtask = task_state.get("task")
+                    if _qtask and not _qtask.done():
+                        _qtask.cancel()
+                    return
+
+            # Yield to event loop so background task can run
+            await _asyncio.sleep(0.3)
+
+            # If task finished and we showed the completion message, wait for key
+            _qtask = task_state.get("task")
+            if not (_qtask and not _qtask.done()) and _task_was_running:
+                ch = _read_key()
+                if ch is not None:
+                    return
+                await _asyncio.sleep(0.3)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if _saved_termios is not None:
+            try:
+                import termios as _tc
+                termios.tcsetattr(_fd, termios.TCSADRAIN, _saved_termios)
+            except Exception:
+                pass
+        # If we exited while task was still running (user pressed q), cancel it
+        _qtask = task_state.get("task")
+        if _task_was_running and _qtask and not _qtask.done():
+            _qtask.cancel()
+            try:
+                await _qtask
+            except _asyncio.CancelledError:
+                pass
+
+
 def prompt_job_id(queue: QueueManager, action: str) -> str | None:
     """Prompt for a valid job ID from the queue."""
     jobs = queue.jobs
