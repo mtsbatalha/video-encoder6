@@ -2,6 +2,7 @@
 
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -36,14 +37,48 @@ def _check_keyboard_input() -> str | None:
         try:
             import msvcrt
             if msvcrt.kbhit():
-                ch = msvcrt.getch()
-                # Extended key codes (arrows, etc.) — skip
-                if ch in (b"\xe0", b"\x00"):
+                ch = msvcrt.getwch()
+                # Extended key codes (arrows, F-keys, etc.) — skip
+                if ch in ("\xe0", "\x00"):
+                    msvcrt.getwch()  # consume the second byte
                     return None
-                return ch.decode("utf-8", errors="replace")
-        except ImportError:
+                # Ignore Enter / newline
+                if ch in ("\r", "\n"):
+                    return None
+                return ch
+        except (ImportError, OSError):
             pass
     return None
+
+
+def _msvcrt_getwch_input(timeout: float = 0.5) -> str | None:
+    """Fallback input detection using a thread that blocks on msvcrt.getwch().
+
+    This works even when msvcrt.kbhit() fails inside Rich Live (Windows).
+    Returns the pressed character or None if timeout expires.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import msvcrt
+        result: list[str] = []
+
+        def _wait_key():
+            ch = msvcrt.getwch()
+            # Extended key codes — skip
+            if ch in ("\xe0", "\x00"):
+                msvcrt.getwch()
+                return
+            if ch in ("\r", "\n"):
+                return
+            result.append(ch)
+
+        t = threading.Thread(target=_wait_key, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        return result[0] if result else None
+    except (ImportError, OSError):
+        return None
 
 
 def show_banner() -> None:
@@ -495,19 +530,26 @@ def interactive_queue_menu(
 
     Returns True if the user chose to exit (0), False otherwise.
     """
-    display = None
+    # Commands that need blocking prompts (job ID, confirmations)
+    # must stop the Live display first so Rich Prompt/Confirm can use stdin.
+    PROMPT_COMMANDS = set("34589")
 
     def _make_panel() -> Panel:
         return _render_queue_panel(queue, has_bg_task(), paused_override)
 
-    with Live(_make_panel(), console=console, refresh_per_second=1, screen=False) as live:
-        display = live
+    with Live(_make_panel(), console=console, refresh_per_second=2, screen=False) as live:
         try:
             while True:
-                time.sleep(0.15)
+                time.sleep(0.1)
                 live.update(_make_panel())
 
                 ch = _check_keyboard_input()
+
+                # Fallback: thread-based input if msvcrt.kbhit() doesn't
+                # detect keypresses inside Rich Live (known Windows issue).
+                if ch is None:
+                    ch = _msvcrt_getwch_input(timeout=0.2)
+
                 if ch is None:
                     continue
 
@@ -515,9 +557,17 @@ def interactive_queue_menu(
                 if ch == "0":
                     return True
                 elif ch in "123456789":
-                    live.update(_make_panel())  # final refresh
-                    on_command(ch)
-                    live.update(_make_panel())  # refresh after action
+                    if ch in PROMPT_COMMANDS:
+                        # Stop Live so Rich Prompt/Confirm can use stdin cleanly
+                        live.stop()
+                        try:
+                            on_command(ch)
+                        finally:
+                            live.start()
+                    else:
+                        # Commands 1,2,6,7 — no prompts needed
+                        on_command(ch)
+                    live.update(_make_panel())
         except KeyboardInterrupt:
             return False
 
