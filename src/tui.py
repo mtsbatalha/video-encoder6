@@ -141,6 +141,7 @@ def create_progress() -> Progress:
         TimeRemainingColumn(),
         console=console,
         expand=True,
+        refresh_per_second=4,
     )
 
 

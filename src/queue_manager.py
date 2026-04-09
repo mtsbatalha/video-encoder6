@@ -206,11 +206,11 @@ class QueueManager:
         return None
 
     def mark_job_progress(self, job_id: str, pct: int, speed: str) -> None:
+        """Update job progress in memory only (no disk I/O)."""
         for j in self._jobs:
             if j.id == job_id:
                 j.progress_pct = pct
                 j.speed = speed
-                self.save()
                 break
 
     def mark_job_done(self, job_id: str, success: bool, error: str | None = None) -> None:

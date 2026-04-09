@@ -230,15 +230,32 @@ async def run_conversion(
     cmd: list[str],
     progress_callback: Callable[[int, str], None] | None = None,
 ) -> ConversionResult:
-    """Run a single conversion. Wraps worker for API compatibility."""
+    """Run a single conversion with real-time progress polling."""
     progress = ProgressState()
 
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(
+    future = loop.run_in_executor(
         None,
         lambda: _run_ffmpeg_worker(input_path, output_path, cmd, progress),
     )
 
+    # Poll progress from worker and call callback in real-time
+    last_pct = -1
+    while not future.done():
+        await asyncio.sleep(0.5)
+        snapshot = progress.snapshot()
+        if input_path in snapshot:
+            state = snapshot[input_path]
+            pct = state["pct"]
+            speed = state.get("speed", "")
+            # Only call back when % actually changes (debounce)
+            if pct != last_pct and progress_callback:
+                last_pct = pct
+                progress_callback(pct, speed)
+
+    result = await future
+
+    # Final callback
     if progress_callback:
         if result.success:
             progress_callback(100, "Concluído")

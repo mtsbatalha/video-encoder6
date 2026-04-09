@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 
 from rich.prompt import Confirm, Prompt
@@ -188,13 +189,23 @@ async def process_queue(config: dict, queue: QueueManager) -> None:
             # Create progress task
             task_id = add_conversion_task(progress, Path(job.input_path).name)
 
+            # Throttled disk save: persist to disk every 5s
+            _last_save = time.monotonic()
             def _cb(pct: int, speed: str) -> None:
+                nonlocal _last_save
                 update_progress(progress, task_id, pct, speed)
                 queue.mark_job_progress(job.id, pct, speed)
+                now = time.monotonic()
+                if now - _last_save >= 5.0:
+                    _last_save = now
+                    queue.save()
 
             result = await run_conversion(
                 job.input_path, job.output_path, cmd, progress_callback=_cb
             )
+
+            # Final save
+            queue.save()
 
             queue.mark_job_done(job.id, result.success, result.details if not result.success else None)
 
