@@ -46,10 +46,12 @@ from src.tui import (
     prompt_remote_path,
 )
 from src.remote import (
-    create_temp_dir,
     cleanup_temp_dir,
     copy_remote_source,
 )
+
+# Import uuid for generating unique remote dir names
+import uuid
 
 # Background queue processing task
 _queue_task: asyncio.Task | None = None
@@ -103,6 +105,7 @@ def load_config() -> dict:
         "cleanup_remote_files": "always",  # always, never, ask
         "temp_dir_enabled": False,
         "temp_dir": os.path.join(os.getcwd(), "temp_conversion"),
+        "remote_dir": os.path.join(os.getcwd(), "remote_files"),
     }
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -134,7 +137,9 @@ async def convert_single_file(config: dict, queue: QueueManager) -> None:
         if not remote_path:
             return
 
-        temp_dir = create_temp_dir(directory=config.get("temp_dir"))
+        remote_base = config.get("remote_dir", os.path.join(os.getcwd(), "remote_files"))
+        os.makedirs(remote_base, exist_ok=True)
+        temp_dir = os.path.join(remote_base, str(uuid.uuid4())[:8])
         console.print(f"\n[dim]Copiando para: {temp_dir}[/dim]\n")
 
         def _copy_progress(line: str):
@@ -226,7 +231,9 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
         if not remote_path:
             return
 
-        temp_dir = create_temp_dir(directory=config.get("temp_dir"))
+        remote_base = config.get("remote_dir", os.path.join(os.getcwd(), "remote_files"))
+        os.makedirs(remote_base, exist_ok=True)
+        temp_dir = os.path.join(remote_base, str(uuid.uuid4())[:8])
         console.print(f"\n[dim]Copiando para: {temp_dir}[/dim]\n")
 
         def _copy_progress(line: str):
@@ -712,7 +719,8 @@ async def settings_menu(config: dict) -> None:
     console.print(f"  Arquivos remotos: [cyan]{cleanup_labels.get(config['cleanup_remote_files'], config['cleanup_remote_files'])}[/cyan]")
 
     temp_status = "[green]Ativado[/green]" if config.get("temp_dir_enabled") else "[dim]Desativado[/dim]"
-    console.print(f"  Diretório temporário: {temp_status} [cyan]{config['temp_dir']}[/cyan]\n")
+    console.print(f"  Diretório temporário: {temp_status} [cyan]{config['temp_dir']}[/cyan]")
+    console.print(f"  Pasta remota: [cyan]{config['remote_dir']}[/cyan]\n")
 
     # Output directory
     new_dir = Prompt.ask(
@@ -792,6 +800,15 @@ async def settings_menu(config: dict) -> None:
     if new_temp:
         config["temp_dir"] = os.path.abspath(new_temp)
 
+    # Remote dir path
+    new_remote = Prompt.ask(
+        "Caminho da pasta remota (Enter para manter)",
+        default=config["remote_dir"],
+        console=console,
+    ).strip()
+    if new_remote:
+        config["remote_dir"] = os.path.abspath(new_remote)
+
     save_config(config)
     console.print("\n[green]Configurações salvas.[/green]")
 
@@ -819,6 +836,9 @@ async def main() -> None:
     # Ensure temp directory exists if enabled
     if config.get("temp_dir_enabled"):
         os.makedirs(config["temp_dir"], exist_ok=True)
+
+    # Ensure remote directory exists
+    os.makedirs(config.get("remote_dir", os.path.join(os.getcwd(), "remote_files")), exist_ok=True)
 
     while True:
         show_banner()

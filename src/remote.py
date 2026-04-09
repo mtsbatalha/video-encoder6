@@ -6,7 +6,6 @@ import logging
 import os
 import shutil
 import subprocess
-import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -14,16 +13,6 @@ logger = logging.getLogger(__name__)
 def _find_executable(name: str) -> str | None:
     """Check if an executable is available on PATH."""
     return shutil.which(name)
-
-
-def create_temp_dir(prefix: str = "video_encoder_", directory: str | None = None) -> str:
-    """Create and return the path of a temporary directory.
-
-    Args:
-        prefix: Prefix for the directory name.
-        directory: Base directory to create the temp dir in. Defaults to system temp (/tmp on Linux).
-    """
-    return tempfile.mkdtemp(prefix=prefix, dir=directory)
 
 
 def cleanup_temp_dir(path: str) -> bool:
