@@ -177,7 +177,8 @@ async def convert_single_file(config: dict, queue: QueueManager) -> None:
 
     # Build output path
     output_path = build_output_path(input_path, config["output_dir"], profile.suffix)
-    resolved = resolve_output_path(output_path, config["on_file_exists"])
+    exists_policy = "overwrite" if config.get("temp_dir_enabled") else config["on_file_exists"]
+    resolved = resolve_output_path(output_path, exists_policy)
 
     if resolved is None:
         console.print(f"[yellow]Arquivo já existe, pulando:[/yellow] [dim]{output_path}[/dim]")
@@ -293,7 +294,8 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
         skipped_count = 0
         for f, profile in file_profiles:
             output_path = build_output_path(f, config["output_dir"], profile.suffix)
-            resolved = resolve_output_path(output_path, config["on_file_exists"])
+            exists_policy = "overwrite" if config.get("temp_dir_enabled") else config["on_file_exists"]
+            resolved = resolve_output_path(output_path, exists_policy)
 
             if resolved is None:
                 console.print(f"[yellow]Pulando (já existe):[/yellow] [dim]{Path(f).name}[/dim]")
@@ -336,7 +338,8 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
         skipped_count = 0
         for f in files:
             output_path = build_output_path(f, config["output_dir"], profile.suffix)
-            resolved = resolve_output_path(output_path, config["on_file_exists"])
+            exists_policy = "overwrite" if config.get("temp_dir_enabled") else config["on_file_exists"]
+            resolved = resolve_output_path(output_path, exists_policy)
 
             if resolved is None:
                 console.print(f"[yellow]Pulando (já existe):[/yellow] [dim]{Path(f).name}[/dim]")
