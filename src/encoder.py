@@ -1,4 +1,8 @@
-"""FFmpeg subprocess execution engine with progress tracking."""
+"""FFmpeg subprocess execution engine with progress tracking.
+
+Uses a temp file with FFmpeg's -progress flag for reliable progress
+updates across all platforms (avoids pipe buffering issues on Windows).
+"""
 
 import asyncio
 import os
@@ -6,6 +10,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -49,6 +55,48 @@ def _get_duration(input_path: str) -> float | None:
     return None
 
 
+def _read_progress_file(path: str) -> dict:
+    """Parse key=value pairs from FFmpeg progress file."""
+    data = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line:
+                    key, _, value = line.partition("=")
+                    data[key.strip()] = value.strip()
+    except (OSError, IOError):
+        pass
+    return data
+
+
+def _parse_time_ms(time_str: str) -> float | None:
+    """Convert FFmpeg time string (HH:MM:SS.xx) to seconds."""
+    m = re.match(r"(\d{2}):(\d{2}):(\d{2})\.(\d+)", time_str)
+    if m:
+        h, mi, s, _ = m.groups()
+        return int(h) * 3600 + int(mi) * 60 + float(s)
+    return None
+
+
+def _inject_progress_flag(cmd: list[str], progress_file: str) -> list[str]:
+    """Insert -progress flag before -y/-output in the command."""
+    new_cmd = list(cmd)
+    # Find where -y or the output path is
+    for i, arg in enumerate(new_cmd):
+        if arg == "-y":
+            new_cmd.insert(i, progress_file)
+            new_cmd.insert(i, "pipe:1")
+            new_cmd.insert(i, "-progress")
+            break
+    else:
+        # No -y found, append before last arg (output path)
+        new_cmd.insert(-1, progress_file)
+        new_cmd.insert(-1, "pipe:1")
+        new_cmd.insert(-1, "-progress")
+    return new_cmd
+
+
 async def run_conversion(
     input_path: str,
     output_path: str,
@@ -57,84 +105,71 @@ async def run_conversion(
 ) -> ConversionResult:
     """Execute an FFmpeg conversion with progress tracking.
 
-    Uses FFmpeg's -progress pipe:1 to get periodic progress updates
-    from stdout in a machine-readable format.
-
-    Args:
-        input_path: Path to the input video file.
-        output_path: Path where the output will be written.
-        cmd: The FFmpeg command list (should include -progress pipe:1).
-        progress_callback: Optional callback(completed_percent: int, speed: str).
-
-    Returns:
-        ConversionResult with success/failure status.
+    Uses FFmpeg's -progress flag writing to a temp file, which is
+    read periodically. This avoids pipe buffering issues on Windows.
     """
     # Ensure output directory exists
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    # Get total duration via ffprobe before starting
+    # Get total duration via ffprobe
     total_seconds = _get_duration(input_path)
 
-    # Platform-specific: hide console window on Windows
-    creation_flags = 0
-    if sys.platform == "win32":
-        creation_flags = subprocess.CREATE_NO_WINDOW
+    # Create temp progress file
+    progress_fd, progress_file = tempfile.mkstemp(suffix=".progress")
+    os.close(progress_fd)
 
     try:
+        # Build command with -progress flag pointing to temp file
+        cmd_with_progress = _inject_progress_flag(cmd, progress_file)
+
+        # Platform-specific: hide console window on Windows
+        creation_flags = 0
+        if sys.platform == "win32":
+            creation_flags = subprocess.CREATE_NO_WINDOW
+
         process = await asyncio.create_subprocess_exec(
-            *cmd,
+            *cmd_with_progress,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             creationflags=creation_flags,
         )
 
-        # Parse progress blocks from stdout
-        # Format: key=value pairs separated by blank lines
-        # We care about: out_time=HH:MM:SS.xx and speed=X.Xx
-        time_pattern = re.compile(r"^out_time=(\d{2}):(\d{2}):(\d{2})\.(\d+)$")
-        speed_pattern = re.compile(r"^speed=([\d.]+)x$")
-        progress_marker = re.compile(r"^progress=(continue|end)$")
-
         stderr_lines: list[str] = []
         last_pct = 0
+        last_pos = 0  # File position for reading progress file
 
-        async def _read_stdout():
-            """Parse progress blocks from FFmpeg stdout."""
+        async def _read_progress_file():
+            """Poll progress file every 200ms."""
             nonlocal last_pct
-            assert process.stdout is not None
+            while process.returncode is None:
+                await asyncio.sleep(0.2)
+                data = _read_progress_file(progress_file)
+                if not data:
+                    continue
 
-            buffer = ""
-            while True:
-                chunk = await process.stdout.read(256)
-                if not chunk:
-                    break
-                buffer += chunk.decode("utf-8", errors="replace")
+                # Extract time
+                out_time = data.get("out_time_ms", "")
+                speed = data.get("speed", "")
 
-                # Process complete lines from the buffer
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
+                current_seconds = None
+                if out_time and out_time != "N/A":
+                    try:
+                        current_seconds = float(out_time) / 1_000_000  # microseconds
+                    except ValueError:
+                        time_str = data.get("out_time", "")
+                        current_seconds = _parse_time_ms(time_str)
 
-                    time_match = time_pattern.match(line)
-                    if time_match and progress_callback and total_seconds:
-                        h, m, s, _ = time_match.groups()
-                        current = int(h) * 3600 + int(m) * 60 + float(s)
-                        pct = min(int((current / total_seconds) * 100), 99)
-                        if pct != last_pct:
-                            last_pct = pct
+                speed_str = speed if speed else ""
 
-                    speed_match = speed_pattern.match(line)
-                    speed_str = f"{speed_match.group(1)}x" if speed_match else ""
-
-                    prog_match = progress_marker.match(line)
-                    if prog_match and progress_callback:
-                        speed = speed_str
-                        if total_seconds:
-                            progress_callback(last_pct, speed)
-                        else:
-                            # Fallback: increment progress on each block
-                            last_pct = min(last_pct + 2, 99)
-                            progress_callback(last_pct, speed)
+                if progress_callback and current_seconds and total_seconds:
+                    pct = min(int((current_seconds / total_seconds) * 100), 99)
+                    if pct != last_pct:
+                        last_pct = pct
+                        progress_callback(pct, speed_str)
+                elif progress_callback and current_seconds:
+                    # No total duration, use fallback
+                    last_pct = min(last_pct + 1, 99)
+                    progress_callback(last_pct, speed_str)
 
         async def _read_stderr():
             """Capture stderr for error reporting."""
@@ -148,9 +183,9 @@ async def run_conversion(
                     line.decode("utf-8", errors="replace").strip()
                 )
 
-        # Read stdout and stderr concurrently
+        # Poll progress and read stderr concurrently
         await asyncio.gather(
-            _read_stdout(),
+            _read_progress_file(),
             _read_stderr(),
         )
 
@@ -187,6 +222,12 @@ async def run_conversion(
             success=False,
             details=str(e),
         )
+    finally:
+        # Clean up temp file
+        try:
+            os.unlink(progress_file)
+        except OSError:
+            pass
 
 
 async def run_batch_conversions(
@@ -194,16 +235,7 @@ async def run_batch_conversions(
     max_parallel: int = 2,
     progress_callback: Callable[[str, int, str], None] | None = None,
 ) -> list[ConversionResult]:
-    """Run multiple conversions with configurable parallelism.
-
-    Args:
-        jobs: List of dicts with keys: input_path, output_path, cmd
-        max_parallel: Maximum number of concurrent conversions.
-        progress_callback: Optional callback(filename, percent, speed).
-
-    Returns:
-        List of ConversionResult.
-    """
+    """Run multiple conversions with configurable parallelism."""
     semaphore = asyncio.Semaphore(max_parallel)
     results: list[ConversionResult] = []
 
@@ -238,7 +270,6 @@ def _extract_error(stderr_lines: list[str]) -> str:
     for line in reversed(stderr_lines):
         lower = line.lower()
         if any(kw in lower for kw in error_keywords):
-            # Clean up the line
             clean = re.sub(r"\[.*?\]", "", line).strip()
             if clean and len(clean) > 5:
                 return clean[:200]
