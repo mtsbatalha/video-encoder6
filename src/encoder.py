@@ -1,7 +1,7 @@
-"""FFmpeg subprocess execution engine with progress tracking.
+"""FFmpeg subprocess execution engine with real-time progress tracking.
 
-Uses a temp file with FFmpeg's -progress flag for reliable progress
-updates. Subprocess is run in a thread pool to avoid async pipe issues.
+Uses sync subprocess + ThreadPoolExecutor. The main thread polls
+a shared state dict to update Rich Progress bars in real time.
 """
 
 import asyncio
@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -18,9 +19,6 @@ from pathlib import Path
 from typing import Callable
 
 from src.file_scanner import find_external_subtitles
-
-# Thread pool for running FFmpeg processes
-_executor = ThreadPoolExecutor(max_workers=8)
 
 
 @dataclass
@@ -30,6 +28,28 @@ class ConversionResult:
     file: str
     success: bool
     details: str = ""
+
+
+# Shared progress state: {input_path: {"pct": int, "speed": str}}
+class ProgressState:
+    """Thread-safe progress state shared between worker threads and main thread."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._data: dict[str, dict] = {}
+
+    def set(self, key: str, pct: int, speed: str) -> None:
+        with self._lock:
+            self._data[key] = {"pct": pct, "speed": speed}
+
+    def snapshot(self) -> dict[str, dict]:
+        with self._lock:
+            return dict(self._data)
+
+    def mark_done(self, key: str) -> None:
+        with self._lock:
+            if key in self._data:
+                self._data[key] = {"pct": 100, "speed": "Concluído"}
 
 
 def _get_duration(input_path: str) -> float | None:
@@ -91,90 +111,116 @@ def _inject_progress_flag(cmd: list[str], progress_file: str) -> list[str]:
             new_cmd.insert(i, "-progress")
             new_cmd.insert(i + 1, progress_file)
             return new_cmd
-    # No -y found, insert before the last arg (output path)
     new_cmd.insert(-1, "-progress")
     new_cmd.insert(-1, progress_file)
     return new_cmd
 
 
-def _run_ffmpeg_sync(
+def _run_ffmpeg_worker(
+    input_path: str,
+    output_path: str,
     cmd: list[str],
-    progress_file: str,
-    total_seconds: float | None,
-    progress_callback: Callable[[int, str], None] | None,
-) -> tuple[int, list[str]]:
-    """Run FFmpeg synchronously with progress polling.
+    progress: ProgressState,
+) -> ConversionResult:
+    """Worker function: runs FFmpeg and reports progress to shared state."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    Returns (returncode, stderr_lines).
-    """
-    creation_flags = 0
-    if sys.platform == "win32":
-        creation_flags = subprocess.CREATE_NO_WINDOW
+    total_seconds = _get_duration(input_path)
 
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        creationflags=creation_flags,
-    )
+    progress_fd, progress_file = tempfile.mkstemp(suffix=".progress")
+    os.close(progress_fd)
 
-    last_pct = 0
-    stderr_lines: list[str] = []
+    try:
+        cmd_with_progress = _inject_progress_flag(cmd, progress_file)
 
-    # Poll progress file and read stderr concurrently
-    def poll_progress():
-        nonlocal last_pct
+        creation_flags = 0
+        if sys.platform == "win32":
+            creation_flags = subprocess.CREATE_NO_WINDOW
+
+        process = subprocess.Popen(
+            cmd_with_progress,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=creation_flags,
+        )
+
+        stderr_lines: list[str] = []
+
+        def read_stderr():
+            assert process.stderr is not None
+            for line in process.stderr:
+                stderr_lines.append(
+                    line.decode("utf-8", errors="replace").strip()
+                )
+
+        t_stderr = threading.Thread(target=read_stderr, daemon=True)
+        t_stderr.start()
+
+        # Poll progress and update shared state
         while process.poll() is None:
             time.sleep(0.2)
             data = _read_progress_file(progress_file)
-            if not data:
-                continue
+            if data:
+                out_time_ms = data.get("out_time_ms", "")
+                current_seconds = None
+                if out_time_ms and out_time_ms != "N/A":
+                    try:
+                        current_seconds = float(out_time_ms) / 1_000_000
+                    except ValueError:
+                        pass
 
-            # Try out_time_ms first (microseconds as integer string)
-            out_time_ms = data.get("out_time_ms", "")
-            current_seconds = None
-            if out_time_ms and out_time_ms != "N/A":
-                try:
-                    current_seconds = float(out_time_ms) / 1_000_000
-                except ValueError:
-                    pass
+                if current_seconds is None:
+                    t = data.get("out_time", "")
+                    if t and t != "N/A":
+                        current_seconds = _parse_time_seconds(t)
 
-            # Fall back to out_time (HH:MM:SS.xxxxxx)
-            if current_seconds is None:
-                time_str = data.get("out_time", "")
-                if time_str and time_str != "N/A":
-                    current_seconds = _parse_time_seconds(time_str)
+                speed = data.get("speed", "")
+                speed_str = speed if speed and speed != "N/A" else ""
 
-            speed = data.get("speed", "")
-            speed_str = speed if speed and speed != "N/A" else ""
+                if current_seconds and total_seconds:
+                    pct = min(int((current_seconds / total_seconds) * 100), 99)
+                    progress.set(input_path, pct, speed_str)
+                elif current_seconds:
+                    progress.set(input_path, 1, speed_str)
 
-            if progress_callback and current_seconds and total_seconds:
-                pct = min(int((current_seconds / total_seconds) * 100), 99)
-                if pct != last_pct:
-                    last_pct = pct
-                    progress_callback(pct, speed_str)
-            elif progress_callback and current_seconds:
-                last_pct = min(last_pct + 1, 99)
-                progress_callback(last_pct, speed_str)
+        t_stderr.join(timeout=2)
 
-    def read_stderr():
-        assert process.stderr is not None
-        for line in process.stderr:
-            stderr_lines.append(
-                line.decode("utf-8", errors="replace").strip()
+        if process.returncode == 0:
+            _copy_external_subtitles(input_path, output_path)
+            progress.mark_done(input_path)
+            return ConversionResult(
+                file=input_path,
+                success=True,
+                details=f"Salvo em: {output_path}",
+            )
+        else:
+            error_msg = _extract_error(stderr_lines)
+            progress.set(input_path, 0, f"ERRO: {error_msg}")
+            return ConversionResult(
+                file=input_path,
+                success=False,
+                details=error_msg,
             )
 
-    import threading
-    t1 = threading.Thread(target=poll_progress, daemon=True)
-    t2 = threading.Thread(target=read_stderr, daemon=True)
-    t1.start()
-    t2.start()
-
-    process.wait()
-    t1.join(timeout=2)
-    t2.join(timeout=2)
-
-    return process.returncode, stderr_lines
+    except FileNotFoundError:
+        progress.set(input_path, 0, "ffmpeg não encontrado")
+        return ConversionResult(
+            file=input_path,
+            success=False,
+            details="ffmpeg não encontrado. Instale o FFmpeg com suporte a NVENC.",
+        )
+    except Exception as e:
+        progress.set(input_path, 0, str(e))
+        return ConversionResult(
+            file=input_path,
+            success=False,
+            details=str(e),
+        )
+    finally:
+        try:
+            os.unlink(progress_file)
+        except OSError:
+            pass
 
 
 async def run_conversion(
@@ -183,70 +229,23 @@ async def run_conversion(
     cmd: list[str],
     progress_callback: Callable[[int, str], None] | None = None,
 ) -> ConversionResult:
-    """Execute an FFmpeg conversion with progress tracking.
+    """Run a single conversion synchronously (for single-file mode)."""
+    progress = ProgressState()
 
-    Uses a temp file for FFmpeg's -progress flag, run in a thread pool
-    to avoid async subprocess pipe issues on Windows.
-    """
-    # Ensure output directory exists
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None,
+        lambda: _run_ffmpeg_worker(input_path, output_path, cmd, progress),
+    )
 
-    # Get total duration via ffprobe
-    total_seconds = _get_duration(input_path)
-
-    # Create temp progress file
-    progress_fd, progress_file = tempfile.mkstemp(suffix=".progress")
-    os.close(progress_fd)
-
-    try:
-        # Build command with -progress flag pointing to temp file
-        cmd_with_progress = _inject_progress_flag(cmd, progress_file)
-
-        # Run FFmpeg in thread pool
-        returncode, stderr_lines = await asyncio.get_event_loop().run_in_executor(
-            _executor,
-            lambda: _run_ffmpeg_sync(
-                cmd_with_progress, progress_file, total_seconds, progress_callback
-            ),
-        )
-
-        if returncode == 0:
-            # Copy external subtitles to output folder
-            _copy_external_subtitles(input_path, output_path)
-
-            if progress_callback:
-                progress_callback(100, "Concluído")
-            return ConversionResult(
-                file=input_path,
-                success=True,
-                details=f"Salvo em: {output_path}",
-            )
+    # Report final state via callback
+    if progress_callback:
+        if result.success:
+            progress_callback(100, "Concluído")
         else:
-            error_msg = _extract_error(stderr_lines)
-            return ConversionResult(
-                file=input_path,
-                success=False,
-                details=error_msg,
-            )
+            progress_callback(0, f"ERRO: {result.details}")
 
-    except FileNotFoundError:
-        return ConversionResult(
-            file=input_path,
-            success=False,
-            details="ffmpeg não encontrado. Instale o FFmpeg com suporte a NVENC.",
-        )
-    except Exception as e:
-        return ConversionResult(
-            file=input_path,
-            success=False,
-            details=str(e),
-        )
-    finally:
-        # Clean up temp file
-        try:
-            os.unlink(progress_file)
-        except OSError:
-            pass
+    return result
 
 
 async def run_batch_conversions(
@@ -254,30 +253,48 @@ async def run_batch_conversions(
     max_parallel: int = 2,
     progress_callback: Callable[[str, int, str], None] | None = None,
 ) -> list[ConversionResult]:
-    """Run multiple conversions with configurable parallelism."""
-    semaphore = asyncio.Semaphore(max_parallel)
-    results: list[ConversionResult] = []
+    """Run batch conversions with real-time progress polling from main thread.
 
-    async def _run(job: dict) -> ConversionResult:
-        async with semaphore:
-            input_path = job["input_path"]
-            output_path = job["output_path"]
-            cmd = job["cmd"]
-            filename = Path(input_path).name
+    Worker threads update ProgressState. The main thread polls and calls
+    the callback with latest values, then waits for all to finish.
+    """
+    progress = ProgressState()
+    results: list[ConversionResult] = [None] * len(jobs)  # type: ignore[list-item]
 
-            def _cb(pct: int, speed: str) -> None:
-                if progress_callback:
-                    progress_callback(filename, pct, speed)
+    # Map input_path -> index
+    path_to_idx = {job["input_path"]: i for i, job in enumerate(jobs)}
 
-            result = await run_conversion(
-                input_path, output_path, cmd, progress_callback=_cb
+    with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+        futures = {}
+        for job in jobs:
+            future = executor.submit(
+                _run_ffmpeg_worker,
+                job["input_path"],
+                job["output_path"],
+                job["cmd"],
+                progress,
             )
-            results.append(result)
-            return result
+            futures[future] = job["input_path"]
 
-    tasks = [asyncio.create_task(_run(job)) for job in jobs]
-    await asyncio.gather(*tasks)
-    return results
+        # Main thread: poll progress state and call callback
+        all_done = False
+        while not all_done:
+            await asyncio.sleep(0.2)  # Yield to event loop for Rich Progress refresh
+            snapshot = progress.snapshot()
+            for key, state in snapshot.items():
+                if key in path_to_idx:
+                    idx = path_to_idx[key]
+                    if results[idx] is None and progress_callback:
+                        progress_callback(key, state["pct"], state["speed"])
+
+            all_done = all(f.done() for f in futures)
+
+        # Collect results
+        for future, input_path in futures.items():
+            idx = path_to_idx[input_path]
+            results[idx] = future.result()
+
+    return results  # type: ignore[return-value]
 
 
 def _extract_error(stderr_lines: list[str]) -> str:
