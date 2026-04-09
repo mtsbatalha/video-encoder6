@@ -29,7 +29,6 @@ from src.tui import (
     add_conversion_task,
     console,
     create_progress,
-    interactive_queue_menu,
     print_auto_batch_preview,
     print_batch_preview,
     print_file_info,
@@ -39,7 +38,8 @@ from src.tui import (
     show_banner,
     show_main_menu,
     show_others_menu,
-    show_queue_table,
+    show_queue_menu,
+    watch_queue_live,
     prompt_job_id,
     update_progress,
     prompt_source_type,
@@ -186,35 +186,43 @@ async def convert_single_file(config: dict, queue: QueueManager) -> None:
     else:
         profiles = list_profiles()
 
-    # Select profile
-    profile = select_profile_menu(profiles)
-    if not profile:
+    # Select profile(s) — multi-select enabled
+    profiles_list = select_profile_menu(profiles, multi=True)
+    if not profiles_list:
         return
+    if not isinstance(profiles_list, list):
+        profiles_list = [profiles_list]
 
-    # Build output path
-    output_path = build_output_path(input_path, config["output_dir"], profile.suffix)
-    exists_policy = "overwrite" if config.get("temp_dir_enabled") else config["on_file_exists"]
-    resolved = resolve_output_path(output_path, exists_policy)
+    if len(profiles_list) > 1:
+        console.print(f"\n[dim]{len(profiles_list)} perfis selecionados[/dim]\n")
+        if not Confirm.ask(f"Adicionar {len(profiles_list)} conversão(ões) à fila?", default=True, console=console):
+            console.print("[yellow]Cancelado.[/yellow]")
+            return
 
-    if resolved is None:
-        console.print(f"[yellow]Arquivo já existe, pulando:[/yellow] [dim]{output_path}[/dim]")
-        return
+    # Add each profile as a separate job
+    for profile in profiles_list:
+        # Build output path
+        output_path = build_output_path(input_path, config["output_dir"], profile.suffix)
+        exists_policy = "overwrite" if config.get("temp_dir_enabled") else config["on_file_exists"]
+        resolved = resolve_output_path(output_path, exists_policy)
 
-    # Show info and confirm
-    print_file_info(input_path, profile, resolved)
-    if not Confirm.ask("Adicionar à fila?", default=True, console=console):
-        console.print("[yellow]Cancelado.[/yellow]")
-        return
+        if resolved is None:
+            console.print(f"[yellow]Arquivo já existe, pulando:[/yellow] [dim]{output_path}[/dim]")
+            continue
 
-    # Add to queue
-    job = queue.add(
-        input_path=input_path,
-        output_path=resolved,
-        profile_id=profile.id,
-        profile_name=profile.name,
-        remote_temp_dir=remote_temp_dir,
-    )
-    console.print(f"\n[green]Job adicionado à fila![/green] [dim]ID: {job.id}[/dim]")
+        # Show info
+        print_file_info(input_path, profile, resolved)
+
+        # Add to queue
+        job = queue.add(
+            input_path=input_path,
+            output_path=resolved,
+            profile_id=profile.id,
+            profile_name=profile.name,
+            remote_temp_dir=remote_temp_dir,
+        )
+        console.print(f"[green]Job adicionado à fila![/green] [dim]ID: {job.id} | Perfil: {profile.name}[/dim]")
+
     console.print(f"[dim]Use 'Gerenciar Fila' para processar.[/dim]\n")
 
 
@@ -285,17 +293,18 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
             else:
                 sdr_count += 1
 
-        # Prompt for resolution and HDR mode
+        # Prompt for resolution(s) and HDR mode
         result = prompt_batch_auto_mode(hdr_count, sdr_count)
         if result is None:
             return
-        resolution, hdr_mode = result
+        resolutions, hdr_mode = result
 
-        # Build file→profile mapping
+        # Build file→profile mapping for each resolution
         file_profiles: list[tuple[str, ConversionProfile]] = []
-        for f in files:
-            profile = resolve_auto_profile(file_hdr[f], resolution, hdr_mode)
-            file_profiles.append((f, profile))
+        for resolution in resolutions:
+            for f in files:
+                profile = resolve_auto_profile(file_hdr[f], resolution, hdr_mode)
+                file_profiles.append((f, profile))
 
         # Show preview
         print_auto_batch_preview(file_profiles, config["output_dir"], hdr_count, sdr_count)
@@ -335,18 +344,25 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
         console.print(f"[dim]Use 'Gerenciar Fila' para processar.[/dim]\n")
 
     else:
-        # Manual mode — select single profile for all files
+        # Manual mode — select profile(s), supports multi-select
         profiles = list_profiles()
-        profile = select_profile_menu(profiles)
-        if not profile:
+        selected_profiles = select_profile_menu(profiles, multi=True)
+        if not selected_profiles:
             return
+        if not isinstance(selected_profiles, list):
+            selected_profiles = [selected_profiles]
 
-        # Show preview
-        print_batch_preview(files, profile, config["output_dir"])
+        # Show preview — each file × each profile
+        file_profiles = []
+        for f in files:
+            for profile in selected_profiles:
+                file_profiles.append((f, profile))
+
+        print_auto_batch_preview(file_profiles, config["output_dir"], 0, 0)
 
         # Confirm
         if not Confirm.ask(
-            f"Adicionar {len(files)} arquivo(s) à fila?", default=True, console=console
+            f"Adicionar {len(files)} arquivo(s) × {len(selected_profiles)} perfil(is) à fila?", default=True, console=console
         ):
             console.print("[yellow]Cancelado.[/yellow]")
             return
@@ -354,7 +370,7 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
         # Add to queue
         jobs_added = []
         skipped_count = 0
-        for f in files:
+        for f, profile in file_profiles:
             output_path = build_output_path(f, config["output_dir"], profile.suffix)
             exists_policy = "overwrite" if config.get("temp_dir_enabled") else config["on_file_exists"]
             resolved = resolve_output_path(output_path, exists_policy)
@@ -546,17 +562,22 @@ async def process_queue(config: dict, queue: QueueManager) -> None:
 
 
 async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
-    """Interactive queue submenu with real-time progress display."""
-    global _queue_task
+    """Static queue management menu. Each action is a one-shot operation.
 
-    def _has_bg_task() -> bool:
-        return _queue_task is not None and not _queue_task.done()
+    Option 1 opens a live (real-time) viewer for observation.
+    All other options use normal Prompt.ask/Confirm.ask (cooked terminal mode).
+    """
+    global _queue_task, _current_conversion
 
-    def _handle_command(ch: str) -> None:
-        global _queue_task, _current_conversion
-        _main_debug_logger.info("[_handle_command] ch='%s' | queue.jobs=%s | running=%d",
-                                ch, [j.id for j in queue.jobs], queue.running_count)
-        if ch == "1":
+    while True:
+        choice = show_queue_menu(queue)
+
+        if choice == "0":
+            return
+        elif choice == "1":
+            # Ver fila — real-time read-only viewer
+            watch_queue_live(queue)
+        elif choice == "2":
             if _queue_task and not _queue_task.done():
                 console.print("[yellow]Fila já está sendo processada em segundo plano.[/yellow]\n")
             elif queue.pending_count == 0 and queue.scheduled_count == 0:
@@ -564,56 +585,45 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
             else:
                 _queue_task = asyncio.create_task(process_queue(config, queue))
                 console.print("[green]Processamento iniciado![/green]\n")
-        elif ch == "2":
+        elif choice == "3":
             new_state = queue.toggle_pause()
             state = "pausada" if new_state else "retomada"
-            _main_debug_logger.info("[_handle_command] command 2: toggle_pause -> %s", state)
             console.print(f"[green]Fila {state}.[/green]\n")
-        elif ch == "3":
+        elif choice == "4":
             job_id = prompt_job_id(queue, "mover para cima")
-            _main_debug_logger.info("[_handle_command] command 3: prompt_job_id=%s", job_id)
             if job_id and queue.move_up(job_id):
                 console.print("[green]Job movido para cima.[/green]\n")
-        elif ch == "4":
+        elif choice == "5":
             job_id = prompt_job_id(queue, "mover para baixo")
             if job_id and queue.move_down(job_id):
                 console.print("[green]Job movido para baixo.[/green]\n")
-        elif ch == "5":
-            _main_debug_logger.info("[_handle_command] command 5: remove job — prompting for ID")
+        elif choice == "6":
             job_id = Prompt.ask(
-                "ID do job para remover (pode digitar apenas os primeiros caracteres)",
+                "ID do job para remover (ou prefixo)",
                 console=console,
             ).strip()
-            _main_debug_logger.info("[_handle_command] command 5: user input job_id='%s'", job_id)
             if job_id:
-                # Find job by exact match or prefix match
                 job = next((j for j in queue.jobs if j.id == job_id), None)
-                _main_debug_logger.info("[_handle_command] command 5: exact match=%s", job.id if job else "None")
                 if job is None:
                     job = next((j for j in queue.jobs if j.id.startswith(job_id)), None)
-                    _main_debug_logger.info("[_handle_command] command 5: prefix match=%s", job.id if job else "None")
                 if job is None:
-                    _main_debug_logger.warning("[_handle_command] command 5: job NOT found for input '%s'", job_id)
                     console.print(f"[yellow]Job '{job_id}' não encontrado na fila.[/yellow]\n")
                 else:
-                    job_id = job.id  # Use full ID
-                    _main_debug_logger.info("[_handle_command] command 5: found job %s status='%s'", job_id, job.status)
+                    job_id = job.id
                     if job.status == "running":
-                        _main_debug_logger.info("[_handle_command] command 5: cancelling running job")
                         queue.remove(job_id, cancel_running=True)
                         if _current_conversion and not _current_conversion.done():
                             _current_conversion.cancel()
                         console.print(f"[yellow]Job {job_id} cancelado e removido.[/yellow]\n")
                     elif queue.remove(job_id):
-                        _main_debug_logger.info("[_handle_command] command 5: removed job %s", job_id)
                         console.print(f"[green]Job {job_id} removido.[/green]\n")
-        elif ch == "6":
+        elif choice == "7":
             removed = queue.remove_completed()
             console.print(f"[green]{removed} job(s) concluído(s) removido(s).[/green]\n")
-        elif ch == "7":
+        elif choice == "8":
             retried = queue.retry_failed()
             console.print(f"[green]{retried} job(s) com falha reenviado(s).[/green]\n")
-        elif ch == "8":
+        elif choice == "9":
             job_id = prompt_job_id(queue, "agendar")
             if job_id:
                 scheduled_at = Prompt.ask(
@@ -627,8 +637,7 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
                         queue.save()
                         console.print(f"[green]Job agendado para {scheduled_at}.[/green]\n")
                         break
-        elif ch == "9":
-            _main_debug_logger.info("[_handle_command] command 9: clear queue — asking confirmation")
+        elif choice == "a":
             if Confirm.ask("Limpar toda a fila?", default=False, console=console):
                 delete_outputs = Confirm.ask(
                     "Remover também os arquivos de saída gerados?",
@@ -636,14 +645,8 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
                     console=console,
                 )
                 temp_dir = config["temp_dir"] if config.get("temp_dir_enabled") else None
-                _main_debug_logger.info("[_handle_command] command 9: clearing delete_outputs=%s", delete_outputs)
                 deleted = queue.clear_all(delete_outputs=delete_outputs, temp_dir=temp_dir)
-                _main_debug_logger.info("[_handle_command] command 9: deleted %d files", deleted)
                 console.print("[green]Fila limpa.[/green]\n")
-
-    exited = interactive_queue_menu(queue, _has_bg_task, _handle_command)
-    if exited:
-        return
 
 
 async def kill_ffmpeg_processes() -> None:

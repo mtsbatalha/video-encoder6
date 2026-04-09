@@ -227,8 +227,12 @@ def show_others_menu() -> str:
     return choice
 
 
-def select_profile_menu(profiles: list[ConversionProfile]) -> ConversionProfile | None:
-    """Show profile selection menu and return the chosen profile."""
+def select_profile_menu(profiles: list[ConversionProfile], multi: bool = False) -> list[ConversionProfile] | ConversionProfile | None:
+    """Show profile selection menu and return the chosen profile(s).
+
+    When multi=True, accepts comma-separated numbers (e.g. "1,3,4").
+    Returns a list of profiles when multi=True, single profile otherwise.
+    """
     console.print("\n[bold]Perfis de Conversão:[/bold]\n")
 
     table = Table(show_header=True, header_style="bold cyan", border_style="dim")
@@ -242,14 +246,28 @@ def select_profile_menu(profiles: list[ConversionProfile]) -> ConversionProfile 
     console.print(table)
     console.print()
 
-    choices = [str(i) for i in range(1, len(profiles) + 1)]
-    choice = Prompt.ask(
-        "Selecione o perfil",
-        choices=choices,
-        default="1",
-        console=console,
-    )
-    return profiles[int(choice) - 1]
+    if multi:
+        console.print("  [dim]Separe com vírgula para selecionar múltiplos (ex: 1,3,4)[/dim]\n")
+        raw = Prompt.ask("Selecione os perfis", default="1", console=console).strip()
+        choices = [c.strip() for c in raw.split(",") if c.strip()]
+        result = []
+        for c in choices:
+            try:
+                idx = int(c) - 1
+                if 0 <= idx < len(profiles):
+                    result.append(profiles[idx])
+            except ValueError:
+                pass
+        return result if result else None
+    else:
+        choices = [str(i) for i in range(1, len(profiles) + 1)]
+        choice = Prompt.ask(
+            "Selecione o perfil",
+            choices=choices,
+            default="1",
+            console=console,
+        )
+        return profiles[int(choice) - 1]
 
 
 def print_file_info(input_path: str, profile: ConversionProfile, output_path: str) -> None:
@@ -488,20 +506,28 @@ def show_queue_table(queue: QueueManager) -> None:
 
 
 def show_queue_menu(queue: QueueManager) -> str:
-    """Show queue management menu and return choice."""
+    """Show static queue management menu (no real-time updates).
+
+    Returns the user's choice. Each action is handled via Prompt.ask/Confirm.ask
+    in cooked mode — no raw terminal, no background refresh.
+    """
+    # Show a snapshot of the queue
+    show_queue_table(queue)
+
     console.print("[bold]Gerenciar Fila:[/bold]\n")
-    console.print("  [1] Processar fila")
-    console.print("  [2] Pausar / Retomar")
-    console.print("  [3] Mover job para cima")
-    console.print("  [4] Mover job para baixo")
-    console.print("  [5] Remover job")
-    console.print("  [6] Remover concluídos")
-    console.print("  [7] Retentar falhas")
-    console.print("  [8] Agendar job")
-    console.print("  [9] Limpar fila")
+    console.print("  [1] Ver fila (tempo real)")
+    console.print("  [2] Processar fila")
+    console.print("  [3] Pausar / Retomar")
+    console.print("  [4] Mover job para cima")
+    console.print("  [5] Mover job para baixo")
+    console.print("  [6] Remover job")
+    console.print("  [7] Remover concluídos")
+    console.print("  [8] Retentar falhas")
+    console.print("  [9] Agendar job")
+    console.print("  [a] Limpar fila")
     console.print("  [0] Voltar\n")
 
-    choices = [str(i) for i in range(10)]
+    choices = [str(i) for i in range(10)] + ["a"]
     return Prompt.ask(
         "Escolha uma opção",
         choices=choices,
@@ -510,127 +536,12 @@ def show_queue_menu(queue: QueueManager) -> str:
     )
 
 
-def _render_queue_panel(queue: QueueManager, has_bg_task: bool, paused_override: bool | None = None) -> Panel:
-    """Render the queue table + menu as a single Panel for Live display."""
-    stats = queue.get_stats()
-    is_paused = paused_override if paused_override is not None else stats["paused"]
-    status_tag = "[red]PAUSADA[/red]" if is_paused else "[green]ATIVA[/green]"
+def watch_queue_live(queue: QueueManager) -> None:
+    """Real-time queue viewer (read-only).
 
-    lines = [
-        f"Estado: {status_tag}  |  "
-        f"Pendentes: [yellow]{stats['pending']}[/yellow]  "
-        f"Rodando: [blue]{stats['running']}[/blue]  "
-        f"Concluídas: [green]{stats['completed']}[/green]  "
-        f"Falhas: [red]{stats['failed']}[/red]  "
-        f"Agendadas: [cyan]{stats['scheduled']}[/cyan]",
-    ]
-
-    if has_bg_task:
-        running_job = next((j for j in queue.jobs if j.status == "running"), None)
-        if running_job:
-            lines.append(
-                f"[bold green]Convertendo: {Path(running_job.input_path).name} "
-                f"({running_job.progress_pct}%)  |  {running_job.speed or ''}[/bold green]"
-            )
-        else:
-            lines.append("[bold green]Processando fila em segundo plano...[/bold green]")
-
-    table = Table(show_header=True, header_style="bold cyan", border_style="dim", padding=(0, 0))
-    table.add_column("#", style="yellow", width=3)
-    table.add_column("ID", style="dim", width=10)
-    table.add_column("Arquivo", style="white")
-    table.add_column("Perfil", style="cyan", width=12)
-    table.add_column("Progresso", style="white", width=10)
-    table.add_column("Velocidade", style="dim", width=10)
-    table.add_column("Status", style="white", width=12)
-
-    pending_idx = 0
-    for j in queue.jobs:
-        pending_idx += 1
-        status_map = {
-            "pending": "[yellow]Pendente[/yellow]",
-            "running": "[blue]Rodando[/blue]",
-            "completed": "[green]Concluído[/green]",
-            "failed": "[red]Falha[/red]",
-            "paused": "[magenta]Pausado[/magenta]",
-            "scheduled": "[cyan]Agendado[/cyan]",
-        }
-        status_text = status_map.get(j.status, j.status)
-
-        if j.status == "completed":
-            progress_bar = "[green]██████████[/green] 100%"
-        elif j.status == "failed":
-            progress_bar = "[red]Falha[/red]"
-        elif j.progress_pct > 0:
-            filled = j.progress_pct // 10
-            empty = 10 - filled
-            progress_bar = f"[yellow]{'█' * filled}{'░' * empty}[/yellow] {j.progress_pct}%"
-        else:
-            progress_bar = "[dim]░░░░░░░░░░ 0%[/dim]"
-
-        speed_text = j.speed or ""
-        filename = Path(j.input_path).name
-
-        table.add_row(
-            str(pending_idx),
-            j.id,
-            filename,
-            j.profile_name[:12] if j.profile_name else "",
-            progress_bar,
-            speed_text,
-            status_text,
-        )
-
-    menu_lines = [
-        "",
-        "[bold]Comandos:[/bold]",
-        "[1] Processar fila   [2] Pausar/Retomar   [3]↑  [4]↓  [5] Remover  [6] Limpar concluídos",
-        "[7] Retentar falhas  [8] Agendar          [9] Limpar fila        [0] Voltar",
-        "[dim]Pressione a tecla do comando...[/dim]",
-    ]
-
-    full_text = "\n".join(lines) + "\n"
-    from rich import box
-    if queue.jobs:
-        # Build renderable: text + table + menu
-        from rich.console import Group
-        menu_text = "\n".join(menu_lines)
-        return Panel(
-            Group(
-                Text.from_markup(full_text),
-                table,
-                Text.from_markup(menu_text),
-            ),
-            title="[bold]Fila de Conversão[/bold]",
-            border_style="cyan",
-            box=box.ROUNDED,
-        )
-    else:
-        full_text += "[dim]  (fila vazia)[/dim]\n"
-        full_text += "\n".join(menu_lines)
-        return Panel(
-            Text.from_markup(full_text),
-            title="[bold]Fila de Conversão[/bold]",
-            border_style="cyan",
-            box=box.ROUNDED,
-        )
-
-
-def interactive_queue_menu(
-    queue: QueueManager,
-    has_bg_task: bool,
-    on_command: callable,
-    paused_override: bool | None = None,
-) -> bool:
-    """Show queue management menu with real-time updates via rich.Live.
-
-    Uses raw terminal mode on Linux (tty) for non-blocking key capture
-    in the main loop — no background thread, so Prompt.ask/Confirm.ask
-    never compete for stdin. On Windows, uses msvcrt.kbhit().
-
-    Returns True if the user chose to exit (0), False otherwise.
+    Shows the queue table updating live. Press any key (0-9) to exit.
+    No commands are processed here — this is purely for observation.
     """
-    PROMPT_COMMANDS = set("34589")
     _is_win = sys.platform == "win32"
     if _is_win:
         try:
@@ -639,19 +550,17 @@ def interactive_queue_menu(
             _is_win = False
 
     def _read_key() -> str | None:
-        """Non-blocking read of a single command key (0-9) from stdin."""
         if _is_win:
             import msvcrt as _ms
             if _ms.kbhit():
                 ch = _ms.getwch()
                 if ch in ("\xe0", "\x00"):
-                    _ms.getwch()  # consume extended byte
+                    _ms.getwch()
                     return None
                 if ch in ("\r", "\n"):
                     return None
-                return ch if ch in "0123456789" else None
+                return ch
             return None
-        # Linux: stdin is in raw mode, select with short timeout
         import select as _sel
         try:
             ready, _, _ = _sel.select([sys.stdin], [], [], 0.05)
@@ -662,15 +571,11 @@ def interactive_queue_menu(
                     return None
                 if ch in ("\r", "\n"):
                     return None
-                return ch if ch in "0123456789" else None
+                return ch
         except Exception:
             pass
         return None
 
-    def _make_panel() -> Panel:
-        return _render_queue_panel(queue, has_bg_task(), paused_override)
-
-    # On Linux, use raw terminal mode for non-blocking character input
     _saved_termios = None
     _fd = sys.stdin.fileno()
     if not _is_win:
@@ -685,7 +590,97 @@ def interactive_queue_menu(
     _last_rendered = None
     try:
         while True:
-            panel = _make_panel()
+            stats = queue.get_stats()
+            is_paused = stats["paused"]
+            status_tag = "[red]PAUSADA[/red]" if is_paused else "[green]ATIVA[/green]"
+
+            lines = [
+                f"Estado: {status_tag}  |  "
+                f"Pendentes: [yellow]{stats['pending']}[/yellow]  "
+                f"Rodando: [blue]{stats['running']}[/blue]  "
+                f"Concluídas: [green]{stats['completed']}[/green]  "
+                f"Falhas: [red]{stats['failed']}[/red]  "
+                f"Agendadas: [cyan]{stats['scheduled']}[/cyan]",
+            ]
+
+            running_job = next((j for j in queue.jobs if j.status == "running"), None)
+            if running_job:
+                lines.append(
+                    f"[bold green]Convertendo: {Path(running_job.input_path).name} "
+                    f"({running_job.progress_pct}%)  |  {running_job.speed or ''}[/bold green]"
+                )
+
+            table = Table(show_header=True, header_style="bold cyan", border_style="dim", padding=(0, 0))
+            table.add_column("#", style="yellow", width=3)
+            table.add_column("ID", style="dim", width=10)
+            table.add_column("Arquivo", style="white")
+            table.add_column("Perfil", style="cyan", width=12)
+            table.add_column("Progresso", style="white", width=10)
+            table.add_column("Velocidade", style="dim", width=10)
+            table.add_column("Status", style="white", width=12)
+
+            pending_idx = 0
+            for j in queue.jobs:
+                pending_idx += 1
+                status_map = {
+                    "pending": "[yellow]Pendente[/yellow]",
+                    "running": "[blue]Rodando[/blue]",
+                    "completed": "[green]Concluído[/green]",
+                    "failed": "[red]Falha[/red]",
+                    "paused": "[magenta]Pausado[/magenta]",
+                    "scheduled": "[cyan]Agendado[/cyan]",
+                }
+                status_text = status_map.get(j.status, j.status)
+
+                if j.status == "completed":
+                    progress_bar = "[green]██████████[/green] 100%"
+                elif j.status == "failed":
+                    progress_bar = "[red]Falha[/red]"
+                elif j.progress_pct > 0:
+                    filled = j.progress_pct // 10
+                    empty = 10 - filled
+                    progress_bar = f"[yellow]{'█' * filled}{'░' * empty}[/yellow] {j.progress_pct}%"
+                else:
+                    progress_bar = "[dim]░░░░░░░░░░ 0%[/dim]"
+
+                speed_text = j.speed or ""
+                filename = Path(j.input_path).name
+
+                table.add_row(
+                    str(pending_idx),
+                    j.id,
+                    filename,
+                    j.profile_name[:12] if j.profile_name else "",
+                    progress_bar,
+                    speed_text,
+                    status_text,
+                )
+
+            from rich import box
+            from rich.console import Group
+            footer = "[dim]Pressione qualquer tecla para voltar...[/dim]"
+
+            if queue.jobs:
+                panel = Panel(
+                    Group(
+                        Text.from_markup("\n".join(lines) + "\n"),
+                        table,
+                        Text.from_markup(footer),
+                    ),
+                    title="[bold]Fila de Conversão (ao vivo)[/bold]",
+                    border_style="cyan",
+                    box=box.ROUNDED,
+                )
+            else:
+                lines.append("[dim]  (fila vazia)[/dim]")
+                lines.append(footer)
+                panel = Panel(
+                    Text.from_markup("\n".join(lines)),
+                    title="[bold]Fila de Conversão (ao vivo)[/bold]",
+                    border_style="cyan",
+                    box=box.ROUNDED,
+                )
+
             panel_text = str(panel)
             if panel_text != _last_rendered:
                 _last_rendered = panel_text
@@ -693,45 +688,16 @@ def interactive_queue_menu(
                 console.print(panel)
 
             ch = _read_key()
-            if ch is None:
-                continue
-
-            if ch == "0":
-                _debug_logger.debug("[QueueMenu] command '0' — exit menu")
-                return True
-            elif ch in "123456789":
-                _debug_logger.debug("[QueueMenu] command '%s' received", ch)
-                if ch in PROMPT_COMMANDS:
-                    _debug_logger.debug("[QueueMenu] prompt command '%s' — restoring terminal", ch)
-                    # Restore terminal to cooked mode for Prompt.ask/Confirm.ask
-                    if _saved_termios:
-                        import termios as _tc
-                        termios.tcsetattr(_fd, termios.TCSADRAIN, _saved_termios)
-                    try:
-                        _debug_logger.debug("[QueueMenu] calling on_command('%s')", ch)
-                        on_command(ch)
-                        _debug_logger.debug("[QueueMenu] on_command('%s') returned", ch)
-                    except Exception as e:
-                        _debug_logger.error("[QueueMenu] on_command('%s') exception: %s", ch, e, exc_info=True)
-                    finally:
-                        # Restore raw mode
-                        if _saved_termios:
-                            import tty as _tty
-                            _tty.setraw(_fd)
-                        _debug_logger.debug("[QueueMenu] raw mode restored")
-                else:
-                    _debug_logger.debug("[QueueMenu] instant command '%s' — calling on_command", ch)
-                    on_command(ch)
-                _last_rendered = None  # Force refresh after command
+            if ch is not None:
+                return
+            time.sleep(0.3)
     except KeyboardInterrupt:
-        return False
+        pass
     finally:
-        # Always restore terminal settings on exit
         if _saved_termios is not None:
             try:
                 import termios as _tc
                 termios.tcsetattr(_fd, termios.TCSADRAIN, _saved_termios)
-                _debug_logger.debug("[QueueMenu] terminal settings restored")
             except Exception:
                 pass
 
@@ -773,13 +739,14 @@ def prompt_conversion_mode() -> str:
     return "auto" if choice == "2" else "manual"
 
 
-def prompt_batch_auto_mode(hdr_count: int, sdr_count: int) -> tuple[str, str] | None:
+def prompt_batch_auto_mode(hdr_count: int, sdr_count: int) -> tuple[list[str], str] | None:
     """Prompt for automatic batch mode settings.
 
-    Shows HDR/SDR summary, asks for resolution and HDR output mode.
+    Shows HDR/SDR summary, asks for resolution(s) and HDR output mode.
+    Resolution supports multi-select (e.g. "1,2" for both 4K and 1080p).
 
-    Returns (resolution, hdr_mode) where:
-      - resolution: "4k" or "1080p"
+    Returns (resolutions, hdr_mode) where:
+      - resolutions: list of "4k" and/or "1080p"
       - hdr_mode: "hdr" (keep HDR) or "sdr" (convert HDR to SDR)
         Only relevant when hdr_count > 0.
     """
@@ -790,18 +757,18 @@ def prompt_batch_auto_mode(hdr_count: int, sdr_count: int) -> tuple[str, str] | 
         console.print(f"  [cyan]{sdr_count}[/cyan] arquivo(s) SDR")
     console.print()
 
-    # Resolution
+    # Resolution — multi-select
     console.print("[bold]Resolução de saída:[/bold]\n")
     console.print("  [1] 4K")
-    console.print("  [2] 1080p\n")
+    console.print("  [2] 1080p")
+    console.print("  [dim]Separe com vírgula para selecionar múltiplas (ex: 1,2)[/dim]\n")
 
-    res_choice = Prompt.ask(
-        "Escolha a resolução",
-        choices=["1", "2"],
-        default="1",
-        console=console,
-    )
-    resolution = "4k" if res_choice == "1" else "1080p"
+    res_input = Prompt.ask("Escolha a resolução", default="1", console=console).strip()
+    res_choices = [c.strip() for c in res_input.split(",") if c.strip()]
+    resolution_map = {"1": "4k", "2": "1080p"}
+    resolutions = [resolution_map[c] for c in res_choices if c in resolution_map]
+    if not resolutions:
+        resolutions = ["4k"]
 
     # HDR output mode (only if there are HDR files)
     hdr_mode = "sdr"  # default
@@ -818,7 +785,7 @@ def prompt_batch_auto_mode(hdr_count: int, sdr_count: int) -> tuple[str, str] | 
         )
         hdr_mode = "hdr" if hdr_choice == "1" else "sdr"
 
-    return resolution, hdr_mode
+    return resolutions, hdr_mode
 
 
 def prompt_source_type() -> str:
