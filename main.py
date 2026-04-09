@@ -15,14 +15,20 @@ from src.file_scanner import (
     detect_hdr,
     scan_video_files,
 )
-from src.profiles import get_matching_profiles, list_profiles
+from src.profiles import (
+    get_matching_profiles,
+    list_profiles,
+    resolve_auto_profile,
+)
 from src.queue_manager import QueueManager
 from src.tui import (
     add_conversion_task,
     console,
     create_progress,
+    print_auto_batch_preview,
     print_batch_preview,
     print_file_info,
+    prompt_batch_auto_mode,
     prompt_conversion_mode,
     select_profile_menu,
     show_banner,
@@ -238,54 +244,109 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
     mode = prompt_conversion_mode()
 
     if mode == "auto":
-        # Detect HDR from first file as reference for entire batch
-        is_hdr = detect_hdr(files[0])
-        hdr_label = "HDR detectado" if is_hdr else "SDR detectado"
-        console.print(f"[green]{hdr_label} (baseado no primeiro arquivo)[/green]\n")
-        profiles = get_matching_profiles(is_hdr)
+        # Detect HDR for every file
+        console.print("\n[dim]Detectando HDR/SDR em cada arquivo...[/dim]")
+        file_hdr: dict[str, bool] = {}
+        hdr_count = 0
+        sdr_count = 0
+        for f in files:
+            is_hdr = detect_hdr(f)
+            file_hdr[f] = is_hdr
+            if is_hdr:
+                hdr_count += 1
+            else:
+                sdr_count += 1
+
+        # Prompt for resolution and HDR mode
+        result = prompt_batch_auto_mode(hdr_count, sdr_count)
+        if result is None:
+            return
+        resolution, hdr_mode = result
+
+        # Build file→profile mapping
+        file_profiles: list[tuple[str, ConversionProfile]] = []
+        for f in files:
+            profile = resolve_auto_profile(file_hdr[f], resolution, hdr_mode)
+            file_profiles.append((f, profile))
+
+        # Show preview
+        print_auto_batch_preview(file_profiles, config["output_dir"], hdr_count, sdr_count)
+
+        # Confirm
+        if not Confirm.ask(
+            f"Adicionar {len(files)} arquivo(s) à fila?", default=True, console=console
+        ):
+            console.print("[yellow]Cancelado.[/yellow]")
+            return
+
+        # Add to queue
+        jobs_added = []
+        skipped_count = 0
+        for f, profile in file_profiles:
+            output_path = build_output_path(f, config["output_dir"], profile.suffix)
+            resolved = resolve_output_path(output_path, config["on_file_exists"])
+
+            if resolved is None:
+                console.print(f"[yellow]Pulando (já existe):[/yellow] [dim]{Path(f).name}[/dim]")
+                skipped_count += 1
+                continue
+
+            job = queue.add(
+                input_path=f,
+                output_path=resolved,
+                profile_id=profile.id,
+                profile_name=profile.name,
+                remote_temp_dir=remote_temp_dir,
+            )
+            jobs_added.append(job)
+
+        console.print(f"\n[green]{len(jobs_added)} job(s) adicionado(s) à fila![/green]")
+        if skipped_count:
+            console.print(f"[yellow]{skipped_count} arquivo(s) pulado(s) (já existem).[/yellow]")
+        console.print(f"[dim]Use 'Gerenciar Fila' para processar.[/dim]\n")
+
     else:
+        # Manual mode — select single profile for all files
         profiles = list_profiles()
+        profile = select_profile_menu(profiles)
+        if not profile:
+            return
 
-    # Select profile
-    profile = select_profile_menu(profiles)
-    if not profile:
-        return
+        # Show preview
+        print_batch_preview(files, profile, config["output_dir"])
 
-    # Show preview
-    print_batch_preview(files, profile, config["output_dir"])
+        # Confirm
+        if not Confirm.ask(
+            f"Adicionar {len(files)} arquivo(s) à fila?", default=True, console=console
+        ):
+            console.print("[yellow]Cancelado.[/yellow]")
+            return
 
-    # Confirm
-    if not Confirm.ask(
-        f"Adicionar {len(files)} arquivo(s) à fila?", default=True, console=console
-    ):
-        console.print("[yellow]Cancelado.[/yellow]")
-        return
+        # Add to queue
+        jobs_added = []
+        skipped_count = 0
+        for f in files:
+            output_path = build_output_path(f, config["output_dir"], profile.suffix)
+            resolved = resolve_output_path(output_path, config["on_file_exists"])
 
-    # Add to queue
-    jobs_added = []
-    skipped_count = 0
-    for f in files:
-        output_path = build_output_path(f, config["output_dir"], profile.suffix)
-        resolved = resolve_output_path(output_path, config["on_file_exists"])
+            if resolved is None:
+                console.print(f"[yellow]Pulando (já existe):[/yellow] [dim]{Path(f).name}[/dim]")
+                skipped_count += 1
+                continue
 
-        if resolved is None:
-            console.print(f"[yellow]Pulando (já existe):[/yellow] [dim]{Path(f).name}[/dim]")
-            skipped_count += 1
-            continue
+            job = queue.add(
+                input_path=f,
+                output_path=resolved,
+                profile_id=profile.id,
+                profile_name=profile.name,
+                remote_temp_dir=remote_temp_dir,
+            )
+            jobs_added.append(job)
 
-        job = queue.add(
-            input_path=f,
-            output_path=resolved,
-            profile_id=profile.id,
-            profile_name=profile.name,
-            remote_temp_dir=remote_temp_dir,
-        )
-        jobs_added.append(job)
-
-    console.print(f"\n[green]{len(jobs_added)} job(s) adicionado(s) à fila![/green]")
-    if skipped_count:
-        console.print(f"[yellow]{skipped_count} arquivo(s) pulado(s) (já existem).[/yellow]")
-    console.print(f"[dim]Use 'Gerenciar Fila' para processar.[/dim]\n")
+        console.print(f"\n[green]{len(jobs_added)} job(s) adicionado(s) à fila![/green]")
+        if skipped_count:
+            console.print(f"[yellow]{skipped_count} arquivo(s) pulado(s) (já existem).[/yellow]")
+        console.print(f"[dim]Use 'Gerenciar Fila' para processar.[/dim]\n")
 
 
 def _handle_remote_cleanup(config: dict, queue: QueueManager) -> None:

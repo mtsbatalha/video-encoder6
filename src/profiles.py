@@ -266,6 +266,30 @@ def get_matching_profiles(is_hdr: bool) -> list[ConversionProfile]:
     return [PROFILES[pid] for pid in ids]
 
 
+def resolve_auto_profile(is_hdr: bool, resolution: str, hdr_mode: str) -> ConversionProfile:
+    """Resolve the correct profile for a file given its HDR status and user choices.
+
+    Args:
+        is_hdr: Whether the source file is HDR.
+        resolution: "4k" or "1080p".
+        hdr_mode: "hdr" (keep HDR) or "sdr" (convert to SDR). Only affects HDR files.
+
+    Returns:
+        The matching ConversionProfile.
+    """
+    if is_hdr:
+        if resolution == "4k":
+            return PROFILES["hdr_to_4k_hdr" if hdr_mode == "hdr" else "hdr_to_4k_sdr"]
+        else:
+            return PROFILES["hdr_to_1080p_hdr" if hdr_mode == "hdr" else "hdr_to_1080p_sdr"]
+    else:
+        # SDR source → always SDR output
+        if resolution == "4k":
+            return PROFILES["sdr_to_4k_sdr"]
+        else:
+            return PROFILES["sdr_to_1080p_sdr"]
+
+
 def get_profile(profile_id: str) -> ConversionProfile | None:
     """Get a profile by ID, or None if not found."""
     return PROFILES.get(profile_id)

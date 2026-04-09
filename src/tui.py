@@ -101,20 +101,53 @@ def print_file_info(input_path: str, profile: ConversionProfile, output_path: st
 def print_batch_preview(
     files: list[str], profile: ConversionProfile, output_dir: str
 ) -> None:
-    """Display batch conversion preview."""
+    """Display batch conversion preview (single profile)."""
     table = Table(show_header=True, header_style="bold cyan", border_style="dim")
     table.add_column("#", style="yellow", width=4)
     table.add_column("Arquivo", style="white")
+    table.add_column("Perfil", style="cyan", width=16)
     table.add_column("Destino", style="dim")
 
     for i, f in enumerate(files, 1):
         dest = Path(f).stem + f"_{profile_suffix(profile)}.mkv"
-        table.add_row(str(i), Path(f).name, dest)
+        table.add_row(str(i), Path(f).name, profile.name, dest)
 
     console.print(
         Panel(
             f"[bold]{len(files)}[/bold] arquivo(s) encontrado(s)\n"
             f"[bold]Perfil:[/bold] {profile.name}",
+            title="[cyan]Conversão em Lote[/cyan]",
+            border_style="cyan",
+        )
+    )
+    console.print(table)
+    console.print()
+
+
+def print_auto_batch_preview(
+    file_profiles: list[tuple[str, ConversionProfile]], output_dir: str,
+    hdr_count: int, sdr_count: int,
+) -> None:
+    """Display batch conversion preview when files have mixed profiles."""
+    table = Table(show_header=True, header_style="bold cyan", border_style="dim")
+    table.add_column("#", style="yellow", width=4)
+    table.add_column("Arquivo", style="white")
+    table.add_column("Perfil", style="cyan", width=16)
+    table.add_column("Destino", style="dim")
+
+    for i, (f, profile) in enumerate(file_profiles, 1):
+        dest = Path(f).stem + f"_{profile_suffix(profile)}.mkv"
+        table.add_row(str(i), Path(f).name, profile.name, dest)
+
+    summary_parts = [f"[bold]{len(file_profiles)}[/bold] arquivo(s)"]
+    if hdr_count:
+        summary_parts.append(f"[magenta]{hdr_count} HDR[/magenta]")
+    if sdr_count:
+        summary_parts.append(f"[cyan]{sdr_count} SDR[/cyan]")
+
+    console.print(
+        Panel(
+            "  ".join(summary_parts),
             title="[cyan]Conversão em Lote[/cyan]",
             border_style="cyan",
         )
@@ -331,7 +364,7 @@ def prompt_conversion_mode() -> str:
     """
     console.print("\n[bold]Modo de seleção de perfil:[/bold]\n")
     console.print("  [1] Manual — Escolher o perfil manualmente")
-    console.print("  [2] Automático — Detectar HDR/SDR e mostrar perfis compatíveis\n")
+    console.print("  [2] Automático — Detectar HDR/SDR de cada arquivo e delegar automaticamente\n")
 
     choice = Prompt.ask(
         "Escolha o modo",
@@ -340,6 +373,54 @@ def prompt_conversion_mode() -> str:
         console=console,
     )
     return "auto" if choice == "2" else "manual"
+
+
+def prompt_batch_auto_mode(hdr_count: int, sdr_count: int) -> tuple[str, str] | None:
+    """Prompt for automatic batch mode settings.
+
+    Shows HDR/SDR summary, asks for resolution and HDR output mode.
+
+    Returns (resolution, hdr_mode) where:
+      - resolution: "4k" or "1080p"
+      - hdr_mode: "hdr" (keep HDR) or "sdr" (convert HDR to SDR)
+        Only relevant when hdr_count > 0.
+    """
+    console.print(f"\n[bold]Resumo da detecção:[/bold]")
+    if hdr_count:
+        console.print(f"  [magenta]{hdr_count}[/magenta] arquivo(s) HDR")
+    if sdr_count:
+        console.print(f"  [cyan]{sdr_count}[/cyan] arquivo(s) SDR")
+    console.print()
+
+    # Resolution
+    console.print("[bold]Resolução de saída:[/bold]\n")
+    console.print("  [1] 4K")
+    console.print("  [2] 1080p\n")
+
+    res_choice = Prompt.ask(
+        "Escolha a resolução",
+        choices=["1", "2"],
+        default="1",
+        console=console,
+    )
+    resolution = "4k" if res_choice == "1" else "1080p"
+
+    # HDR output mode (only if there are HDR files)
+    hdr_mode = "sdr"  # default
+    if hdr_count > 0:
+        console.print(f"\n[bold]Arquivos HDR:[/bold]\n")
+        console.print("  [1] Manter HDR (10-bit)")
+        console.print("  [2] Converter para SDR (tonemap Hable)\n")
+
+        hdr_choice = Prompt.ask(
+            "Escolha o modo de saída para HDR",
+            choices=["1", "2"],
+            default="2",
+            console=console,
+        )
+        hdr_mode = "hdr" if hdr_choice == "1" else "sdr"
+
+    return resolution, hdr_mode
 
 
 def prompt_source_type() -> str:
