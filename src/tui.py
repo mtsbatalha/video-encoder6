@@ -582,12 +582,14 @@ def interactive_queue_menu(
                         return True
                     elif ch in "123456789":
                         if ch in PROMPT_COMMANDS:
-                            # Stop Live so Rich Prompt/Confirm can use stdin cleanly
+                            # Stop key reader so it doesn't steal stdin from Prompt.ask
+                            key_reader.stop()
                             live.stop()
                             try:
                                 on_command(ch)
                             finally:
                                 live.start()
+                                key_reader.start()
                         else:
                             on_command(ch)
                         live.update(_make_panel())
