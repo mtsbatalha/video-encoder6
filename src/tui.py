@@ -725,7 +725,8 @@ def interactive_queue_menu(
                 _last_rendered = None  # Force refresh after command
     except KeyboardInterrupt:
         return False
-        # Restore terminal settings
+    finally:
+        # Always restore terminal settings on exit
         if _saved_termios is not None:
             try:
                 import termios as _tc
