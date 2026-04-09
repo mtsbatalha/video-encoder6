@@ -1,9 +1,12 @@
 """Rich-based TUI components for the video encoder."""
 
 import os
+import sys
+import time
 from pathlib import Path
 
 from rich.console import Console
+from rich.live import Live
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
@@ -22,6 +25,25 @@ from src.profiles import ConversionProfile
 from src.queue_manager import QueueManager, QueueJob
 
 console = Console()
+
+
+def _check_keyboard_input() -> str | None:
+    """Non-blocking single-character keyboard input (Windows only).
+
+    Returns the pressed character or None if no key was pressed.
+    """
+    if sys.platform == "win32":
+        try:
+            import msvcrt
+            if msvcrt.kbhit():
+                ch = msvcrt.getch()
+                # Extended key codes (arrows, etc.) — skip
+                if ch in (b"\xe0", b"\x00"):
+                    return None
+                return ch.decode("utf-8", errors="replace")
+        except ImportError:
+            pass
+    return None
 
 
 def show_banner() -> None:
@@ -352,6 +374,152 @@ def show_queue_menu(queue: QueueManager) -> str:
         default="0",
         console=console,
     )
+
+
+def _render_queue_panel(queue: QueueManager, has_bg_task: bool, paused_override: bool | None = None) -> Panel:
+    """Render the queue table + menu as a single Panel for Live display."""
+    stats = queue.get_stats()
+    is_paused = paused_override if paused_override is not None else stats["paused"]
+    status_tag = "[red]PAUSADA[/red]" if is_paused else "[green]ATIVA[/green]"
+
+    lines = [
+        f"Estado: {status_tag}  |  "
+        f"Pendentes: [yellow]{stats['pending']}[/yellow]  "
+        f"Rodando: [blue]{stats['running']}[/blue]  "
+        f"Concluídas: [green]{stats['completed']}[/green]  "
+        f"Falhas: [red]{stats['failed']}[/red]  "
+        f"Agendadas: [cyan]{stats['scheduled']}[/cyan]",
+    ]
+
+    if has_bg_task:
+        running_job = next((j for j in queue.jobs if j.status == "running"), None)
+        if running_job:
+            lines.append(
+                f"[bold green]Convertendo: {Path(running_job.input_path).name} "
+                f"({running_job.progress_pct}%)  |  {running_job.speed or ''}[/bold green]"
+            )
+        else:
+            lines.append("[bold green]Processando fila em segundo plano...[/bold green]")
+
+    table = Table(show_header=True, header_style="bold cyan", border_style="dim", padding=(0, 0))
+    table.add_column("#", style="yellow", width=3)
+    table.add_column("ID", style="dim", width=10)
+    table.add_column("Arquivo", style="white")
+    table.add_column("Perfil", style="cyan", width=12)
+    table.add_column("Progresso", style="white", width=10)
+    table.add_column("Velocidade", style="dim", width=10)
+    table.add_column("Status", style="white", width=12)
+
+    pending_idx = 0
+    for j in queue.jobs:
+        pending_idx += 1
+        status_map = {
+            "pending": "[yellow]Pendente[/yellow]",
+            "running": "[blue]Rodando[/blue]",
+            "completed": "[green]Concluído[/green]",
+            "failed": "[red]Falha[/red]",
+            "paused": "[magenta]Pausado[/magenta]",
+            "scheduled": "[cyan]Agendado[/cyan]",
+        }
+        status_text = status_map.get(j.status, j.status)
+
+        if j.status == "completed":
+            progress_bar = "[green]██████████[/green] 100%"
+        elif j.status == "failed":
+            progress_bar = "[red]Falha[/red]"
+        elif j.progress_pct > 0:
+            filled = j.progress_pct // 10
+            empty = 10 - filled
+            progress_bar = f"[yellow]{'█' * filled}{'░' * empty}[/yellow] {j.progress_pct}%"
+        else:
+            progress_bar = "[dim]░░░░░░░░░░ 0%[/dim]"
+
+        speed_text = j.speed or ""
+        filename = Path(j.input_path).name
+
+        table.add_row(
+            str(pending_idx),
+            j.id,
+            filename,
+            j.profile_name[:12] if j.profile_name else "",
+            progress_bar,
+            speed_text,
+            status_text,
+        )
+
+    menu_lines = [
+        "",
+        "[bold]Comandos:[/bold]",
+        "[1] Processar fila   [2] Pausar/Retomar   [3]↑  [4]↓  [5] Remover  [6] Limpar concluídos",
+        "[7] Retentar falhas  [8] Agendar          [9] Limpar fila        [0] Voltar",
+        "[dim]Pressione a tecla do comando...[/dim]",
+    ]
+
+    full_text = "\n".join(lines) + "\n"
+    if queue.jobs:
+        from rich import box
+        # Build renderable: text + table + menu
+        from rich.console import Group
+        menu_text = "\n".join(menu_lines)
+        return Panel(
+            Group(
+                Text.from_markup(full_text),
+                table,
+                Text.from_markup(menu_text),
+            ),
+            title="[bold]Fila de Conversão[/bold]",
+            border_style="cyan",
+            box=box.ROUNDED,
+        )
+    else:
+        full_text += "[dim]  (fila vazia)[/dim]\n"
+        full_text += "\n".join(menu_lines)
+        return Panel(
+            Text.from_markup(full_text),
+            title="[bold]Fila de Conversão[/bold]",
+            border_style="cyan",
+            box=box.ROUNDED,
+        )
+
+
+def interactive_queue_menu(
+    queue: QueueManager,
+    has_bg_task: bool,
+    on_command: callable,
+    paused_override: bool | None = None,
+) -> bool:
+    """Show queue management menu with real-time updates via rich.Live.
+
+    Polls for keyboard input (non-blocking) while the Live display
+    auto-refreshes the queue table.
+
+    Returns True if the user chose to exit (0), False otherwise.
+    """
+    display = None
+
+    def _make_panel() -> Panel:
+        return _render_queue_panel(queue, has_bg_task(), paused_override)
+
+    with Live(_make_panel(), console=console, refresh_per_second=1, screen=False) as live:
+        display = live
+        try:
+            while True:
+                time.sleep(0.15)
+                live.update(_make_panel())
+
+                ch = _check_keyboard_input()
+                if ch is None:
+                    continue
+
+                # Process command
+                if ch == "0":
+                    return True
+                elif ch in "123456789":
+                    live.update(_make_panel())  # final refresh
+                    on_command(ch)
+                    live.update(_make_panel())  # refresh after action
+        except KeyboardInterrupt:
+            return False
 
 
 def prompt_job_id(queue: QueueManager, action: str) -> str | None:

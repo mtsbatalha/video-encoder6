@@ -28,6 +28,7 @@ from src.tui import (
     add_conversion_task,
     console,
     create_progress,
+    interactive_queue_menu,
     print_auto_batch_preview,
     print_batch_preview,
     print_file_info,
@@ -38,7 +39,6 @@ from src.tui import (
     show_main_menu,
     show_others_menu,
     show_queue_table,
-    show_queue_menu,
     prompt_job_id,
     update_progress,
     prompt_source_type,
@@ -489,57 +489,49 @@ async def process_queue(config: dict, queue: QueueManager) -> None:
 
 
 async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
-    """Interactive queue management submenu."""
+    """Interactive queue submenu with real-time progress display."""
     global _queue_task
 
-    while True:
-        show_queue_table(queue)
+    def _has_bg_task() -> bool:
+        return _queue_task is not None and not _queue_task.done()
 
-        # Show background task status
-        if _queue_task and not _queue_task.done():
-            console.print("[bold green]⬢ Conversão em andamento (segundo plano)[/bold green]\n")
-
-        choice = show_queue_menu(queue)
-
-        if choice == "0":
-            break
-        elif choice == "1":
+    def _handle_command(ch: str) -> None:
+        nonlocal _queue_task
+        if ch == "1":
             if _queue_task and not _queue_task.done():
                 console.print("[yellow]Fila já está sendo processada em segundo plano.[/yellow]\n")
+            elif queue.pending_count == 0 and queue.scheduled_count == 0:
+                console.print("[yellow]Nenhum job pendente ou agendado na fila.[/yellow]\n")
             else:
-                if queue.pending_count == 0 and queue.scheduled_count == 0:
-                    console.print("[yellow]Nenhum job pendente ou agendado na fila.[/yellow]\n")
-                else:
-                    _queue_task = asyncio.create_task(process_queue(config, queue))
-                    console.print("[green]Processamento iniciado em segundo plano![/green]\n")
-                    console.print("[dim]Use 'Gerenciar Fila' para acompanhar o progresso.[/dim]\n")
-        elif choice == "2":
+                _queue_task = asyncio.create_task(process_queue(config, queue))
+                console.print("[green]Processamento iniciado![/green]\n")
+        elif ch == "2":
             new_state = queue.toggle_pause()
             state = "pausada" if new_state else "retomada"
             console.print(f"[green]Fila {state}.[/green]\n")
-        elif choice == "3":
+        elif ch == "3":
             job_id = prompt_job_id(queue, "mover para cima")
             if job_id and queue.move_up(job_id):
                 console.print("[green]Job movido para cima.[/green]\n")
-        elif choice == "4":
+        elif ch == "4":
             job_id = prompt_job_id(queue, "mover para baixo")
             if job_id and queue.move_down(job_id):
                 console.print("[green]Job movido para baixo.[/green]\n")
-        elif choice == "5":
+        elif ch == "5":
             job_id = prompt_job_id(queue, "remover")
             if job_id and queue.remove(job_id):
                 console.print("[green]Job removido.[/green]\n")
-        elif choice == "6":
+        elif ch == "6":
             removed = queue.remove_completed()
             console.print(f"[green]{removed} job(s) concluído(s) removido(s).[/green]\n")
-        elif choice == "7":
+        elif ch == "7":
             retried = queue.retry_failed()
-            console.print(f"[green]{retried} job(s) com falha reenviado(s) para pendente.[/green]\n")
-        elif choice == "8":
+            console.print(f"[green]{retried} job(s) com falha reenviado(s).[/green]\n")
+        elif ch == "8":
             job_id = prompt_job_id(queue, "agendar")
             if job_id:
                 scheduled_at = Prompt.ask(
-                    "Data/hora (YYYY-MM-DDTHH:MM:SS, ex: 2026-04-09T02:00:00)",
+                    "Data/hora (YYYY-MM-DDTHH:MM:SS)",
                     console=console,
                 ).strip()
                 for j in queue.jobs:
@@ -549,7 +541,7 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
                         queue.save()
                         console.print(f"[green]Job agendado para {scheduled_at}.[/green]\n")
                         break
-        elif choice == "9":
+        elif ch == "9":
             if Confirm.ask("Limpar toda a fila?", default=False, console=console):
                 delete_outputs = Confirm.ask(
                     "Remover também os arquivos de saída gerados?",
@@ -558,11 +550,11 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
                 )
                 temp_dir = config["temp_dir"] if config.get("temp_dir_enabled") else None
                 deleted = queue.clear_all(delete_outputs=delete_outputs, temp_dir=temp_dir)
-                console.print("[green]Fila limpa.[/green]")
-                if delete_outputs and deleted:
-                    console.print(f"[dim]{deleted} arquivo(s) removido(s).[/dim]\n")
-                else:
-                    console.print()
+                console.print("[green]Fila limpa.[/green]\n")
+
+    exited = interactive_queue_menu(queue, _has_bg_task, _handle_command)
+    if exited:
+        return
 
 
 async def kill_ffmpeg_processes() -> None:
