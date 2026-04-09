@@ -57,10 +57,13 @@ async def run_conversion(
 ) -> ConversionResult:
     """Execute an FFmpeg conversion with progress tracking.
 
+    Uses FFmpeg's -progress pipe:1 to get periodic progress updates
+    from stdout in a machine-readable format.
+
     Args:
         input_path: Path to the input video file.
         output_path: Path where the output will be written.
-        cmd: The FFmpeg command list.
+        cmd: The FFmpeg command list (should include -progress pipe:1).
         progress_callback: Optional callback(completed_percent: int, speed: str).
 
     Returns:
@@ -85,47 +88,71 @@ async def run_conversion(
             creationflags=creation_flags,
         )
 
-        speed_pattern = re.compile(r"speed=\s*([\d.]+)\s*x")
-        time_pattern = re.compile(r"time=\s*(\d{2}:\d{2}:\d{2}\.\d{2})")
+        # Parse progress blocks from stdout
+        # Format: key=value pairs separated by blank lines
+        # We care about: out_time=HH:MM:SS.xx and speed=X.Xx
+        time_pattern = re.compile(r"^out_time=(\d{2}):(\d{2}):(\d{2})\.(\d+)$")
+        speed_pattern = re.compile(r"^speed=([\d.]+)x$")
+        progress_marker = re.compile(r"^progress=(continue|end)$")
 
         stderr_lines: list[str] = []
         last_pct = 0
-        last_time_reported = 0.0
 
-        assert process.stderr is not None
-        while True:
-            line = await process.stderr.readline()
-            if not line:
-                break
-            line_str = line.decode("utf-8", errors="replace").strip()
-            stderr_lines.append(line_str)
+        async def _read_stdout():
+            """Parse progress blocks from FFmpeg stdout."""
+            nonlocal last_pct
+            assert process.stdout is not None
 
-            # Extract current time from FFmpeg progress lines
-            time_match = time_pattern.search(line_str)
-            if time_match:
-                parts = time_match.group(1).split(":")
-                current_seconds = (
-                    int(parts[0]) * 3600
-                    + int(parts[1]) * 60
-                    + float(parts[2])
+            buffer = ""
+            while True:
+                chunk = await process.stdout.read(256)
+                if not chunk:
+                    break
+                buffer += chunk.decode("utf-8", errors="replace")
+
+                # Process complete lines from the buffer
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+
+                    time_match = time_pattern.match(line)
+                    if time_match and progress_callback and total_seconds:
+                        h, m, s, _ = time_match.groups()
+                        current = int(h) * 3600 + int(m) * 60 + float(s)
+                        pct = min(int((current / total_seconds) * 100), 99)
+                        if pct != last_pct:
+                            last_pct = pct
+
+                    speed_match = speed_pattern.match(line)
+                    speed_str = f"{speed_match.group(1)}x" if speed_match else ""
+
+                    prog_match = progress_marker.match(line)
+                    if prog_match and progress_callback:
+                        speed = speed_str
+                        if total_seconds:
+                            progress_callback(last_pct, speed)
+                        else:
+                            # Fallback: increment progress on each block
+                            last_pct = min(last_pct + 2, 99)
+                            progress_callback(last_pct, speed)
+
+        async def _read_stderr():
+            """Capture stderr for error reporting."""
+            nonlocal stderr_lines
+            assert process.stderr is not None
+            while True:
+                line = await process.stderr.readline()
+                if not line:
+                    break
+                stderr_lines.append(
+                    line.decode("utf-8", errors="replace").strip()
                 )
 
-                # Extract speed (only present on same line as time)
-                speed_match = speed_pattern.search(line_str)
-                speed_str = f"{speed_match.group(1)}x" if speed_match else ""
-
-                # Calculate percentage
-                if progress_callback and total_seconds and total_seconds > 0:
-                    pct = min(int((current_seconds / total_seconds) * 100), 99)
-                    # Only report if percentage changed (reduces UI thrash)
-                    if pct != last_pct:
-                        last_pct = pct
-                        progress_callback(pct, speed_str)
-                elif progress_callback and speed_str:
-                    # Fallback: report with indeterminate progress but show speed
-                    if not total_seconds:
-                        last_pct = min(last_pct + 1, 99)
-                        progress_callback(last_pct, speed_str)
+        # Read stdout and stderr concurrently
+        await asyncio.gather(
+            _read_stdout(),
+            _read_stderr(),
+        )
 
         await process.wait()
 

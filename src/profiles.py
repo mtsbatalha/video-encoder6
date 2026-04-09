@@ -42,6 +42,7 @@ def _build_4k_sdr(input_path: str, output_path: str) -> list[str]:
         "-b:a", "384k",
         "-ar", "48000",
         "-c:s", "copy",
+        "-progress", "pipe:1",
         "-y",
         output_path,
     ]
@@ -74,6 +75,7 @@ def _build_4k_hdr(input_path: str, output_path: str) -> list[str]:
         "-b:a", "384k",
         "-ar", "48000",
         "-c:s", "copy",
+        "-progress", "pipe:1",
         "-y",
         output_path,
     ]
@@ -106,6 +108,7 @@ def _build_1080p_hdr(input_path: str, output_path: str) -> list[str]:
         "-b:a", "384k",
         "-ar", "48000",
         "-c:s", "copy",
+        "-progress", "pipe:1",
         "-y",
         output_path,
     ]
@@ -138,6 +141,7 @@ def _build_1080p_sdr(input_path: str, output_path: str) -> list[str]:
         "-b:a", "384k",
         "-ar", "48000",
         "-c:s", "copy",
+        "-progress", "pipe:1",
         "-y",
         output_path,
     ]
