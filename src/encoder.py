@@ -22,6 +22,33 @@ class ConversionResult:
     details: str = ""
 
 
+def _get_duration(input_path: str) -> float | None:
+    """Get video duration in seconds using ffprobe."""
+    creation_flags = 0
+    if sys.platform == "win32":
+        creation_flags = subprocess.CREATE_NO_WINDOW
+
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                input_path,
+            ],
+            capture_output=True,
+            creationflags=creation_flags,
+            timeout=30,
+        )
+        out = result.stdout.decode("utf-8", errors="replace").strip()
+        if out:
+            return float(out)
+    except Exception:
+        pass
+    return None
+
+
 async def run_conversion(
     input_path: str,
     output_path: str,
@@ -42,6 +69,9 @@ async def run_conversion(
     # Ensure output directory exists
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
+    # Get total duration via ffprobe before starting
+    total_seconds = _get_duration(input_path)
+
     # Platform-specific: hide console window on Windows
     creation_flags = 0
     if sys.platform == "win32":
@@ -55,19 +85,12 @@ async def run_conversion(
             creationflags=creation_flags,
         )
 
-        # Read stderr line by line for progress
         speed_pattern = re.compile(r"speed=\s*([\d.]+)\s*x")
         time_pattern = re.compile(r"time=\s*(\d{2}:\d{2}:\d{2}\.\d{2})")
 
-        # We need total duration for percentage calculation
-        # FFmpeg prints duration early in stderr: "Duration: HH:MM:SS.cc"
-        duration_pattern = re.compile(
-            r"Duration:\s*(\d{2}):(\d{2}):(\d{2})\.(\d{2})"
-        )
-        total_seconds = None
-        current_seconds = None
-
         stderr_lines: list[str] = []
+        last_pct = 0
+        last_time_reported = 0.0
 
         assert process.stderr is not None
         while True:
@@ -77,32 +100,32 @@ async def run_conversion(
             line_str = line.decode("utf-8", errors="replace").strip()
             stderr_lines.append(line_str)
 
-            # Try to extract total duration
-            if total_seconds is None:
-                dur_match = duration_pattern.search(line_str)
-                if dur_match:
-                    h, m, s, _ = dur_match.groups()
-                    total_seconds = int(h) * 3600 + int(m) * 60 + float(s)
-
-            # Extract current time
+            # Extract current time from FFmpeg progress lines
             time_match = time_pattern.search(line_str)
             if time_match:
                 parts = time_match.group(1).split(":")
-                h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
-                current_seconds = h * 3600 + m * 60 + s
+                current_seconds = (
+                    int(parts[0]) * 3600
+                    + int(parts[1]) * 60
+                    + float(parts[2])
+                )
 
-            # Extract speed
-            speed_match = speed_pattern.search(line_str)
-            speed_str = f"{speed_match.group(1)}x" if speed_match else ""
+                # Extract speed (only present on same line as time)
+                speed_match = speed_pattern.search(line_str)
+                speed_str = f"{speed_match.group(1)}x" if speed_match else ""
 
-            # Calculate percentage
-            if (
-                progress_callback
-                and total_seconds
-                and current_seconds is not None
-            ):
-                pct = min(int((current_seconds / total_seconds) * 100), 99)
-                progress_callback(pct, speed_str)
+                # Calculate percentage
+                if progress_callback and total_seconds and total_seconds > 0:
+                    pct = min(int((current_seconds / total_seconds) * 100), 99)
+                    # Only report if percentage changed (reduces UI thrash)
+                    if pct != last_pct:
+                        last_pct = pct
+                        progress_callback(pct, speed_str)
+                elif progress_callback and speed_str:
+                    # Fallback: report with indeterminate progress but show speed
+                    if not total_seconds:
+                        last_pct = min(last_pct + 1, 99)
+                        progress_callback(last_pct, speed_str)
 
         await process.wait()
 
