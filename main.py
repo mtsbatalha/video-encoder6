@@ -46,6 +46,9 @@ from src.remote import (
     copy_remote_source,
 )
 
+# Background queue processing task
+_queue_task: asyncio.Task | None = None
+
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 
@@ -384,16 +387,16 @@ def _handle_remote_cleanup(config: dict, queue: QueueManager) -> None:
 
 
 async def process_queue(config: dict, queue: QueueManager) -> None:
-    """Process the queue sequentially, respecting pause state."""
+    """Process the queue sequentially, respecting pause state.
+
+    Runs as a background task — UI remains responsive.
+    """
     if queue.paused:
-        console.print("[yellow]Fila pausada. Retome antes de processar.[/yellow]")
+        console.print("[dim][Fila] Pausada. Aguardando retomar...[/dim]")
         return
 
     if queue.pending_count == 0 and queue.scheduled_count == 0:
-        console.print("[yellow]Nenhum job pendente ou agendado na fila.[/yellow]")
         return
-
-    console.print(f"\n[bold]Processando fila...[/bold] [dim]({queue.pending_count} pendente(s))[/dim]\n")
 
     # Import profiles to build commands
     from src.profiles import get_profile
@@ -401,7 +404,6 @@ async def process_queue(config: dict, queue: QueueManager) -> None:
     with create_progress() as progress:
         while True:
             if queue.paused:
-                console.print("\n[yellow]Fila pausada pelo usuário.[/yellow]")
                 break
 
             job = queue.get_next_job()
@@ -412,7 +414,7 @@ async def process_queue(config: dict, queue: QueueManager) -> None:
             profile = get_profile(job.profile_id)
             if profile is None:
                 queue.mark_job_done(job.id, False, f"Perfil '{job.profile_id}' não encontrado")
-                console.print(f"[red]Perfil '{job.profile_id}' não encontrado para job {job.id}[/red]")
+                console.print(f"[dim]  Perfil '{job.profile_id}' não encontrado para job {job.id}[/dim]")
                 continue
 
             cmd = profile.build_command(job.input_path, job.output_path)
@@ -462,14 +464,29 @@ async def process_queue(config: dict, queue: QueueManager) -> None:
 
 async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
     """Interactive queue management submenu."""
+    global _queue_task
+
     while True:
         show_queue_table(queue)
+
+        # Show background task status
+        if _queue_task and not _queue_task.done():
+            console.print("[bold green]⬢ Conversão em andamento (segundo plano)[/bold green]\n")
+
         choice = show_queue_menu(queue)
 
         if choice == "0":
             break
         elif choice == "1":
-            await process_queue(config, queue)
+            if _queue_task and not _queue_task.done():
+                console.print("[yellow]Fila já está sendo processada em segundo plano.[/yellow]\n")
+            else:
+                if queue.pending_count == 0 and queue.scheduled_count == 0:
+                    console.print("[yellow]Nenhum job pendente ou agendado na fila.[/yellow]\n")
+                else:
+                    _queue_task = asyncio.create_task(process_queue(config, queue))
+                    console.print("[green]Processamento iniciado em segundo plano![/green]\n")
+                    console.print("[dim]Use 'Gerenciar Fila' para acompanhar o progresso.[/dim]\n")
         elif choice == "2":
             new_state = queue.toggle_pause()
             state = "pausada" if new_state else "retomada"
@@ -502,6 +519,14 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
                 for j in queue.jobs:
                     if j.id == job_id:
                         j.scheduled_at = scheduled_at
+                        j.status = "scheduled"
+                        queue.save()
+                        console.print(f"[green]Job agendado para {scheduled_at}.[/green]\n")
+                        break
+        elif choice == "9":
+            if Confirm.ask("Limpar toda a fila?", default=False, console=console):
+                queue.clear_all()
+                console.print("[green]Fila limpa.[/green]\n")
                         j.status = "scheduled"
                         queue.save()
                         console.print(f"[green]Job agendado para {scheduled_at}.[/green]\n")
@@ -587,6 +612,8 @@ async def settings_menu(config: dict) -> None:
 
 async def main() -> None:
     """Main entry point."""
+    global _queue_task
+
     config = load_config()
     queue = QueueManager()
 
@@ -595,6 +622,16 @@ async def main() -> None:
 
     while True:
         show_banner()
+
+        # Show background task status on main menu
+        if _queue_task and not _queue_task.done():
+            running_job = next((j for j in queue.jobs if j.status == "running"), None)
+            if running_job:
+                console.print(f"[bold green]⬢ Conversão ativa: {Path(running_job.input_path).name} ({running_job.progress_pct}%)[/bold green]")
+            else:
+                console.print("[bold green]⬢ Processamento de fila em andamento[/bold green]")
+            console.print()
+
         choice = show_main_menu()
 
         if choice == "1":
@@ -606,10 +643,19 @@ async def main() -> None:
         elif choice == "4":
             await manage_queue_menu(config, queue)
         elif choice == "5":
+            # Cancel background task if running
+            if _queue_task and not _queue_task.done():
+                console.print("\n[yellow]Conversão em andamento. Aguardando finalização...[/yellow]")
+                _queue_task.cancel()
+                try:
+                    await _queue_task
+                except asyncio.CancelledError:
+                    pass
             console.print("[dim]Até mais![/dim]\n")
             break
 
-        input("\nPressione Enter para continuar...")
+        # Non-blocking wait for Enter — lets background tasks run
+        await asyncio.to_thread(input, "\nPressione Enter para continuar...")
 
 
 if __name__ == "__main__":
