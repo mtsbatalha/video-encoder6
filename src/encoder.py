@@ -4,6 +4,8 @@ Uses sync subprocess + ThreadPoolExecutor. The main thread polls
 a shared state dict to update Rich Progress bars in real time.
 """
 
+from __future__ import annotations
+
 import asyncio
 import os
 import re
