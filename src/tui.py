@@ -590,8 +590,8 @@ def _render_queue_panel(queue: QueueManager, has_bg_task: bool, paused_override:
     ]
 
     full_text = "\n".join(lines) + "\n"
+    from rich import box
     if queue.jobs:
-        from rich import box
         # Build renderable: text + table + menu
         from rich.console import Group
         menu_text = "\n".join(menu_lines)
