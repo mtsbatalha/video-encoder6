@@ -684,51 +684,47 @@ def interactive_queue_menu(
 
     _last_rendered = None
     try:
-        with Live(_make_panel(), console=console, refresh_per_second=1, screen=False) as live:
-            try:
-                while True:
-                    panel = _make_panel()
-                    panel_text = str(panel)
-                    if panel_text != _last_rendered:
-                        _last_rendered = panel_text
-                        live.update(panel, refresh=True)
+        while True:
+            panel = _make_panel()
+            panel_text = str(panel)
+            if panel_text != _last_rendered:
+                _last_rendered = panel_text
+                console.clear()
+                console.print(panel)
 
-                    ch = _read_key()
-                    if ch is None:
-                        continue
+            ch = _read_key()
+            if ch is None:
+                continue
 
-                    if ch == "0":
-                        _debug_logger.debug("[QueueMenu] command '0' — exit menu")
-                        return True
-                    elif ch in "123456789":
-                        _debug_logger.debug("[QueueMenu] command '%s' received", ch)
-                        if ch in PROMPT_COMMANDS:
-                            _debug_logger.debug("[QueueMenu] prompt command '%s' — stopping live + restoring terminal", ch)
-                            live.stop()
-                            # Restore terminal to cooked mode for Prompt.ask/Confirm.ask
-                            if _saved_termios:
-                                import termios as _tc
-                                termios.tcsetattr(_fd, termios.TCSADRAIN, _saved_termios)
-                            try:
-                                _debug_logger.debug("[QueueMenu] calling on_command('%s')", ch)
-                                on_command(ch)
-                                _debug_logger.debug("[QueueMenu] on_command('%s') returned", ch)
-                            except Exception as e:
-                                _debug_logger.error("[QueueMenu] on_command('%s') exception: %s", ch, e, exc_info=True)
-                            finally:
-                                # Restore raw mode
-                                if _saved_termios:
-                                    import tty as _tty
-                                    _tty.setraw(_fd)
-                                live.start()
-                                _debug_logger.debug("[QueueMenu] live restarted (raw mode restored)")
-                        else:
-                            _debug_logger.debug("[QueueMenu] instant command '%s' — calling on_command", ch)
-                            on_command(ch)
-                        _last_rendered = None  # Force refresh after command
-            except KeyboardInterrupt:
-                return False
-    finally:
+            if ch == "0":
+                _debug_logger.debug("[QueueMenu] command '0' — exit menu")
+                return True
+            elif ch in "123456789":
+                _debug_logger.debug("[QueueMenu] command '%s' received", ch)
+                if ch in PROMPT_COMMANDS:
+                    _debug_logger.debug("[QueueMenu] prompt command '%s' — restoring terminal", ch)
+                    # Restore terminal to cooked mode for Prompt.ask/Confirm.ask
+                    if _saved_termios:
+                        import termios as _tc
+                        termios.tcsetattr(_fd, termios.TCSADRAIN, _saved_termios)
+                    try:
+                        _debug_logger.debug("[QueueMenu] calling on_command('%s')", ch)
+                        on_command(ch)
+                        _debug_logger.debug("[QueueMenu] on_command('%s') returned", ch)
+                    except Exception as e:
+                        _debug_logger.error("[QueueMenu] on_command('%s') exception: %s", ch, e, exc_info=True)
+                    finally:
+                        # Restore raw mode
+                        if _saved_termios:
+                            import tty as _tty
+                            _tty.setraw(_fd)
+                        _debug_logger.debug("[QueueMenu] raw mode restored")
+                else:
+                    _debug_logger.debug("[QueueMenu] instant command '%s' — calling on_command", ch)
+                    on_command(ch)
+                _last_rendered = None  # Force refresh after command
+    except KeyboardInterrupt:
+        return False
         # Restore terminal settings
         if _saved_termios is not None:
             try:
