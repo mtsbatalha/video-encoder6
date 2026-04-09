@@ -1,7 +1,7 @@
 """FFmpeg subprocess execution engine with progress tracking.
 
 Uses a temp file with FFmpeg's -progress flag for reliable progress
-updates across all platforms (avoids pipe buffering issues on Windows).
+updates. Subprocess is run in a thread pool to avoid async pipe issues.
 """
 
 import asyncio
@@ -12,11 +12,15 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from src.file_scanner import find_external_subtitles
+
+# Thread pool for running FFmpeg processes
+_executor = ThreadPoolExecutor(max_workers=8)
 
 
 @dataclass
@@ -70,12 +74,12 @@ def _read_progress_file(path: str) -> dict:
     return data
 
 
-def _parse_time_ms(time_str: str) -> float | None:
-    """Convert FFmpeg time string (HH:MM:SS.xx) to seconds."""
+def _parse_time_seconds(time_str: str) -> float | None:
+    """Convert FFmpeg time string (HH:MM:SS.xxxxxx) to seconds."""
     m = re.match(r"(\d{2}):(\d{2}):(\d{2})\.(\d+)", time_str)
     if m:
-        h, mi, s, _ = m.groups()
-        return int(h) * 3600 + int(mi) * 60 + float(s)
+        h, mi, s, frac = m.groups()
+        return int(h) * 3600 + int(mi) * 60 + float(f"{s}.{frac}")
     return None
 
 
@@ -93,6 +97,86 @@ def _inject_progress_flag(cmd: list[str], progress_file: str) -> list[str]:
     return new_cmd
 
 
+def _run_ffmpeg_sync(
+    cmd: list[str],
+    progress_file: str,
+    total_seconds: float | None,
+    progress_callback: Callable[[int, str], None] | None,
+) -> tuple[int, list[str]]:
+    """Run FFmpeg synchronously with progress polling.
+
+    Returns (returncode, stderr_lines).
+    """
+    creation_flags = 0
+    if sys.platform == "win32":
+        creation_flags = subprocess.CREATE_NO_WINDOW
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=creation_flags,
+    )
+
+    last_pct = 0
+    stderr_lines: list[str] = []
+
+    # Poll progress file and read stderr concurrently
+    def poll_progress():
+        nonlocal last_pct
+        while process.poll() is None:
+            time.sleep(0.2)
+            data = _read_progress_file(progress_file)
+            if not data:
+                continue
+
+            # Try out_time_ms first (microseconds as integer string)
+            out_time_ms = data.get("out_time_ms", "")
+            current_seconds = None
+            if out_time_ms and out_time_ms != "N/A":
+                try:
+                    current_seconds = float(out_time_ms) / 1_000_000
+                except ValueError:
+                    pass
+
+            # Fall back to out_time (HH:MM:SS.xxxxxx)
+            if current_seconds is None:
+                time_str = data.get("out_time", "")
+                if time_str and time_str != "N/A":
+                    current_seconds = _parse_time_seconds(time_str)
+
+            speed = data.get("speed", "")
+            speed_str = speed if speed and speed != "N/A" else ""
+
+            if progress_callback and current_seconds and total_seconds:
+                pct = min(int((current_seconds / total_seconds) * 100), 99)
+                if pct != last_pct:
+                    last_pct = pct
+                    progress_callback(pct, speed_str)
+            elif progress_callback and current_seconds:
+                last_pct = min(last_pct + 1, 99)
+                progress_callback(last_pct, speed_str)
+
+    def read_stderr():
+        assert process.stderr is not None
+        for line in process.stderr:
+            stderr_lines.append(
+                line.decode("utf-8", errors="replace").strip()
+            )
+
+    import threading
+    t1 = threading.Thread(target=poll_progress, daemon=True)
+    t2 = threading.Thread(target=read_stderr, daemon=True)
+    t1.start()
+    t2.start()
+
+    process.wait()
+    t1.join(timeout=2)
+    t2.join(timeout=2)
+
+    return process.returncode, stderr_lines
+
+
 async def run_conversion(
     input_path: str,
     output_path: str,
@@ -101,8 +185,8 @@ async def run_conversion(
 ) -> ConversionResult:
     """Execute an FFmpeg conversion with progress tracking.
 
-    Uses FFmpeg's -progress flag writing to a temp file, which is
-    read periodically. This avoids pipe buffering issues on Windows.
+    Uses a temp file for FFmpeg's -progress flag, run in a thread pool
+    to avoid async subprocess pipe issues on Windows.
     """
     # Ensure output directory exists
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -118,76 +202,15 @@ async def run_conversion(
         # Build command with -progress flag pointing to temp file
         cmd_with_progress = _inject_progress_flag(cmd, progress_file)
 
-        # Platform-specific: hide console window on Windows
-        creation_flags = 0
-        if sys.platform == "win32":
-            creation_flags = subprocess.CREATE_NO_WINDOW
-
-        process = await asyncio.create_subprocess_exec(
-            *cmd_with_progress,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            creationflags=creation_flags,
+        # Run FFmpeg in thread pool
+        returncode, stderr_lines = await asyncio.get_event_loop().run_in_executor(
+            _executor,
+            lambda: _run_ffmpeg_sync(
+                cmd_with_progress, progress_file, total_seconds, progress_callback
+            ),
         )
 
-        stderr_lines: list[str] = []
-        last_pct = 0
-        last_pos = 0  # File position for reading progress file
-
-        async def _poll_progress():
-            """Poll progress file every 200ms."""
-            nonlocal last_pct
-            while process.returncode is None:
-                await asyncio.sleep(0.2)
-                data = _read_progress_file(progress_file)
-                if not data:
-                    continue
-
-                # Extract time
-                out_time = data.get("out_time_ms", "")
-                speed = data.get("speed", "")
-
-                current_seconds = None
-                if out_time and out_time != "N/A":
-                    try:
-                        current_seconds = float(out_time) / 1_000_000  # microseconds
-                    except ValueError:
-                        time_str = data.get("out_time", "")
-                        current_seconds = _parse_time_ms(time_str)
-
-                speed_str = speed if speed else ""
-
-                if progress_callback and current_seconds and total_seconds:
-                    pct = min(int((current_seconds / total_seconds) * 100), 99)
-                    if pct != last_pct:
-                        last_pct = pct
-                        progress_callback(pct, speed_str)
-                elif progress_callback and current_seconds:
-                    # No total duration, use fallback
-                    last_pct = min(last_pct + 1, 99)
-                    progress_callback(last_pct, speed_str)
-
-        async def _read_stderr():
-            """Capture stderr for error reporting."""
-            nonlocal stderr_lines
-            assert process.stderr is not None
-            while True:
-                line = await process.stderr.readline()
-                if not line:
-                    break
-                stderr_lines.append(
-                    line.decode("utf-8", errors="replace").strip()
-                )
-
-        # Poll progress and read stderr concurrently
-        await asyncio.gather(
-            _poll_progress(),
-            _read_stderr(),
-        )
-
-        await process.wait()
-
-        if process.returncode == 0:
+        if returncode == 0:
             # Copy external subtitles to output folder
             _copy_external_subtitles(input_path, output_path)
 
