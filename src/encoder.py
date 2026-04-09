@@ -138,7 +138,7 @@ async def run_conversion(
         last_pct = 0
         last_pos = 0  # File position for reading progress file
 
-        async def _read_progress_file():
+        async def _poll_progress():
             """Poll progress file every 200ms."""
             nonlocal last_pct
             while process.returncode is None:
@@ -185,7 +185,7 @@ async def run_conversion(
 
         # Poll progress and read stderr concurrently
         await asyncio.gather(
-            _read_progress_file(),
+            _poll_progress(),
             _read_stderr(),
         )
 
