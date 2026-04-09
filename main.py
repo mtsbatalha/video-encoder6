@@ -139,31 +139,30 @@ async def convert_single_file(config: dict, queue: QueueManager) -> None:
 
         remote_base = config.get("remote_dir", os.path.join(os.getcwd(), "remote_files"))
         os.makedirs(remote_base, exist_ok=True)
-        temp_dir = os.path.join(remote_base, str(uuid.uuid4())[:8])
-        console.print(f"\n[dim]Copiando para: {temp_dir}[/dim]\n")
+        console.print(f"\n[dim]Copiando para: {remote_base}[/dim]\n")
 
         def _copy_progress(line: str):
             console.print(f"  [dim]{line}[/dim]")
 
-        success, method = copy_remote_source(remote_path, temp_dir, _copy_progress)
+        success, method = copy_remote_source(remote_path, remote_base, _copy_progress)
 
         if not success:
             console.print("[red]Falha ao copiar arquivos. Verifique se rclone ou rsync está disponível.[/red]")
-            cleanup_temp_dir(temp_dir)
+            cleanup_temp_dir(remote_base)
             return
 
         console.print(f"\n[green]Cópia concluída ({method}).[/green]\n")
 
         # Scan to find video files in temp dir
-        files = scan_video_files(temp_dir)
+        files = scan_video_files(remote_base)
         if not files:
             console.print("[yellow]Nenhum arquivo de vídeo encontrado no caminho remoto.[/yellow]")
-            cleanup_temp_dir(temp_dir)
+            cleanup_temp_dir(remote_base)
             return
 
         # For single file: use first found video
         input_path = files[0]
-        remote_temp_dir = temp_dir
+        remote_temp_dir = remote_base
         console.print(f"[green]Arquivo encontrado: {Path(input_path).name}[/green]\n")
     else:
         input_path = Prompt.ask(
@@ -241,23 +240,22 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
 
         remote_base = config.get("remote_dir", os.path.join(os.getcwd(), "remote_files"))
         os.makedirs(remote_base, exist_ok=True)
-        temp_dir = os.path.join(remote_base, str(uuid.uuid4())[:8])
-        console.print(f"\n[dim]Copiando para: {temp_dir}[/dim]\n")
+        console.print(f"\n[dim]Copiando para: {remote_base}[/dim]\n")
 
         def _copy_progress(line: str):
             console.print(f"  [dim]{line}[/dim]")
 
-        success, method = copy_remote_source(remote_path, temp_dir, _copy_progress)
+        success, method = copy_remote_source(remote_path, remote_base, _copy_progress)
 
         if not success:
             console.print("[red]Falha ao copiar arquivos. Verifique se rclone ou rsync está disponível.[/red]")
-            cleanup_temp_dir(temp_dir)
+            cleanup_temp_dir(remote_base)
             return
 
         console.print(f"\n[green]Cópia concluída ({method}).[/green]\n")
 
-        folder_path = temp_dir
-        remote_temp_dir = temp_dir
+        folder_path = remote_base
+        remote_temp_dir = remote_base
     else:
         folder_path = Prompt.ask(
             "Caminho da pasta com os vídeos",
