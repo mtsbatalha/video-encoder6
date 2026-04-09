@@ -32,6 +32,7 @@ class QueueJob:
     error: str | None = None
     speed: str | None = None
     progress_pct: int = 0
+    remote_temp_dir: str | None = None
 
     def __post_init__(self):
         if not self.created_at:
@@ -112,6 +113,7 @@ class QueueManager:
         profile_id: str,
         profile_name: str,
         scheduled_at: str | None = None,
+        remote_temp_dir: str | None = None,
     ) -> QueueJob:
         job = QueueJob(
             id=str(uuid.uuid4())[:8],
@@ -120,6 +122,7 @@ class QueueManager:
             profile_id=profile_id,
             profile_name=profile_name,
             scheduled_at=scheduled_at,
+            remote_temp_dir=remote_temp_dir,
             status="scheduled" if scheduled_at else "pending",
         )
         self._jobs.append(job)
@@ -238,3 +241,23 @@ class QueueManager:
         self._jobs = []
         self._paused = False
         self.save()
+
+    # ─── Remote Temp Dir Tracking ────────────────────────────────────
+
+    def get_pending_remote_dirs(self) -> list[tuple[str, str]]:
+        """Return list of (job_id, temp_dir) for jobs with uncleaned remote dirs."""
+        return [
+            (j.id, j.remote_temp_dir)
+            for j in self._jobs
+            if j.remote_temp_dir and j.status in ("running", "completed", "failed", "paused")
+        ]
+
+    def mark_remote_dirs_cleaned(self, job_ids: list[str]) -> None:
+        """Clear remote_temp_dir for the given jobs and save."""
+        changed = False
+        for j in self._jobs:
+            if j.id in job_ids and j.remote_temp_dir:
+                j.remote_temp_dir = None
+                changed = True
+        if changed:
+            self.save()

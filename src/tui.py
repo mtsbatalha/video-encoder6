@@ -323,3 +323,29 @@ def prompt_job_id(queue: QueueManager, action: str) -> str | None:
         return None
     return job_id
 
+
+def prompt_source_type() -> str:
+    """Ask if the source is local or remote. Returns 'local' or 'remote'."""
+    console.print("\n[bold]Tipo de origem:[/bold]\n")
+    console.print("  [1] Local (arquivo/pasta no computador)")
+    console.print("  [2] Remoto (rclone mount, SMB, SSHFS, etc.)")
+
+    choice = Prompt.ask(
+        "Escolha o tipo de origem",
+        choices=["1", "2"],
+        default="1",
+        console=console,
+    )
+    return "local" if choice == "1" else "remote"
+
+
+def prompt_remote_path() -> str:
+    """Prompt for a remote/mounted path (rclone remote, SSH mount, SMB, etc.)."""
+    console.print("\n[bold]Caminho remoto[/bold]")
+    console.print("[dim]Exemplos: gdrive:videos/, /mnt/smb/share/, user@host:/path[/dim]\n")
+
+    path = Prompt.ask("Caminho remoto de origem", console=console).strip()
+    if not path:
+        console.print("[yellow]Nenhum caminho informado.[/yellow]")
+    return path
+

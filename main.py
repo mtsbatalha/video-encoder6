@@ -29,6 +29,13 @@ from src.tui import (
     show_queue_menu,
     prompt_job_id,
     update_progress,
+    prompt_source_type,
+    prompt_remote_path,
+)
+from src.remote import (
+    create_temp_dir,
+    cleanup_temp_dir,
+    copy_remote_source,
 )
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -67,6 +74,7 @@ def load_config() -> dict:
         "max_parallel": 2,
         "ffmpeg_path": "ffmpeg",
         "on_file_exists": "skip",  # skip, overwrite, copy
+        "cleanup_remote_files": "always",  # always, never, ask
     }
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -89,17 +97,52 @@ async def convert_single_file(config: dict, queue: QueueManager) -> None:
     """Handle single file conversion workflow — adds to queue."""
     profiles = list_profiles()
 
-    # Get input file path
     console.print("[bold]Conversão de Arquivo Único[/bold]\n")
-    input_path = Prompt.ask(
-        "Caminho do arquivo de vídeo",
-        console=console,
-    ).strip()
 
-    # Validate input file
-    if not input_path or not os.path.isfile(input_path):
-        console.print("[red]Arquivo não encontrado.[/red]")
-        return
+    # Ask if source is local or remote
+    source_type = prompt_source_type()
+    remote_temp_dir = None
+
+    if source_type == "remote":
+        remote_path = prompt_remote_path()
+        if not remote_path:
+            return
+
+        temp_dir = create_temp_dir()
+        console.print(f"\n[dim]Copiando para: {temp_dir}[/dim]\n")
+
+        def _copy_progress(line: str):
+            console.print(f"  [dim]{line}[/dim]")
+
+        success, method = copy_remote_source(remote_path, temp_dir, _copy_progress)
+
+        if not success:
+            console.print("[red]Falha ao copiar arquivos. Verifique se rclone ou rsync está disponível.[/red]")
+            cleanup_temp_dir(temp_dir)
+            return
+
+        console.print(f"\n[green]Cópia concluída ({method}).[/green]\n")
+
+        # Scan to find video files in temp dir
+        files = scan_video_files(temp_dir)
+        if not files:
+            console.print("[yellow]Nenhum arquivo de vídeo encontrado no caminho remoto.[/yellow]")
+            cleanup_temp_dir(temp_dir)
+            return
+
+        # For single file: use first found video
+        input_path = files[0]
+        remote_temp_dir = temp_dir
+        console.print(f"[green]Arquivo encontrado: {Path(input_path).name}[/green]\n")
+    else:
+        input_path = Prompt.ask(
+            "Caminho do arquivo de vídeo",
+            console=console,
+        ).strip()
+
+        if not input_path or not os.path.isfile(input_path):
+            console.print("[red]Arquivo não encontrado.[/red]")
+            return
 
     # Select profile
     profile = select_profile_menu(profiles)
@@ -126,6 +169,7 @@ async def convert_single_file(config: dict, queue: QueueManager) -> None:
         output_path=resolved,
         profile_id=profile.id,
         profile_name=profile.name,
+        remote_temp_dir=remote_temp_dir,
     )
     console.print(f"\n[green]Job adicionado à fila![/green] [dim]ID: {job.id}[/dim]")
     console.print(f"[dim]Use 'Gerenciar Fila' para processar.[/dim]\n")
@@ -136,19 +180,47 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
     profiles = list_profiles()
 
     console.print("[bold]Conversão em Lote[/bold]\n")
-    folder_path = Prompt.ask(
-        "Caminho da pasta com os vídeos",
-        console=console,
-    ).strip()
 
-    if not folder_path or not os.path.isdir(folder_path):
-        console.print("[red]Pasta não encontrada.[/red]")
-        return
+    # Ask if source is local or remote
+    source_type = prompt_source_type()
+    remote_temp_dir = None
+
+    if source_type == "remote":
+        remote_path = prompt_remote_path()
+        if not remote_path:
+            return
+
+        temp_dir = create_temp_dir()
+        console.print(f"\n[dim]Copiando para: {temp_dir}[/dim]\n")
+
+        def _copy_progress(line: str):
+            console.print(f"  [dim]{line}[/dim]")
+
+        success, method = copy_remote_source(remote_path, temp_dir, _copy_progress)
+
+        if not success:
+            console.print("[red]Falha ao copiar arquivos. Verifique se rclone ou rsync está disponível.[/red]")
+            cleanup_temp_dir(temp_dir)
+            return
+
+        console.print(f"\n[green]Cópia concluída ({method}).[/green]\n")
+
+        folder_path = temp_dir
+        remote_temp_dir = temp_dir
+    else:
+        folder_path = Prompt.ask(
+            "Caminho da pasta com os vídeos",
+            console=console,
+        ).strip()
+
+        if not folder_path or not os.path.isdir(folder_path):
+            console.print("[red]Pasta não encontrada.[/red]")
+            return
 
     # Scan for video files
     files = scan_video_files(folder_path)
     if not files:
-        console.print("[yellow]Nenhum arquivo de vídeo encontrado na pasta.[/yellow]")
+        console.print("[yellow]Nenhum arquivo de vídeo encontrado.[/yellow]")
         return
 
     console.print(f"[green]{len(files)}[/green] arquivo(s) encontrado(s).")
@@ -185,6 +257,7 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
             output_path=resolved,
             profile_id=profile.id,
             profile_name=profile.name,
+            remote_temp_dir=remote_temp_dir,
         )
         jobs_added.append(job)
 
@@ -192,6 +265,40 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
     if skipped_count:
         console.print(f"[yellow]{skipped_count} arquivo(s) pulado(s) (já existem).[/yellow]")
     console.print(f"[dim]Use 'Gerenciar Fila' para processar.[/dim]\n")
+
+
+def _handle_remote_cleanup(config: dict, queue: QueueManager) -> None:
+    """Clean up remote temp dirs after queue processing based on config."""
+    pending_dirs = queue.get_pending_remote_dirs()
+    if not pending_dirs:
+        return
+
+    policy = config.get("cleanup_remote_files", "always")
+    cleaned_ids = []
+
+    for job_id, temp_dir in pending_dirs:
+        if policy == "never":
+            console.print(f"[dim]Arquivos temporários mantidos: {temp_dir}[/dim]")
+            continue
+
+        if policy == "ask":
+            if not Confirm.ask(
+                f"Deletar arquivos temporários de job {job_id}? ({temp_dir})",
+                default=True,
+                console=console,
+            ):
+                console.print(f"[dim]Mantendo: {temp_dir}[/dim]")
+                continue
+
+        if cleanup_temp_dir(temp_dir):
+            cleaned_ids.append(job_id)
+            console.print(f"[dim]Temp limpo: {temp_dir}[/dim]")
+        else:
+            console.print(f"[yellow]Falha ao limpar: {temp_dir}[/yellow]")
+            cleaned_ids.append(job_id)
+
+    if cleaned_ids:
+        queue.mark_remote_dirs_cleaned(cleaned_ids)
 
 
 async def process_queue(config: dict, queue: QueueManager) -> None:
@@ -267,6 +374,9 @@ async def process_queue(config: dict, queue: QueueManager) -> None:
     )
     console.print()
 
+    # Cleanup remote temp dirs
+    _handle_remote_cleanup(config, queue)
+
 
 async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
     """Interactive queue management submenu."""
@@ -329,7 +439,10 @@ async def settings_menu(config: dict) -> None:
     console.print(f"  FFmpeg: [cyan]{config['ffmpeg_path']}[/cyan]")
 
     labels = {"skip": "Pular existentes", "overwrite": "Sobrescrever", "copy": "Criar cópia"}
-    console.print(f"  Arquivos existentes: [cyan]{labels.get(config['on_file_exists'], config['on_file_exists'])}[/cyan]\n")
+    console.print(f"  Arquivos existentes: [cyan]{labels.get(config['on_file_exists'], config['on_file_exists'])}[/cyan]")
+
+    cleanup_labels = {"always": "Deletar após conversão", "never": "Manter", "ask": "Perguntar"}
+    console.print(f"  Arquivos remotos: [cyan]{cleanup_labels.get(config['cleanup_remote_files'], config['cleanup_remote_files'])}[/cyan]\n")
 
     # Output directory
     new_dir = Prompt.ask(
@@ -370,6 +483,21 @@ async def settings_menu(config: dict) -> None:
     ).strip()
     if choice in policy_map:
         config["on_file_exists"] = policy_map[choice]
+
+    # Cleanup remote files policy
+    console.print("\n[yellow]Arquivos remotos após conversão:[/yellow]")
+    console.print("  [dim]1[/dim] - Deletar automaticamente (padrão)")
+    console.print("  [dim]2[/dim] - Manter arquivos temporários")
+    console.print("  [dim]3[/dim] - Perguntar antes de deletar")
+    cleanup_map = {"1": "always", "2": "never", "3": "ask"}
+    inverse_cleanup = {"always": "1", "never": "2", "ask": "3"}
+    cleanup_choice = Prompt.ask(
+        "Escolha (1-3, Enter para manter)",
+        default=inverse_cleanup.get(config["cleanup_remote_files"], "1"),
+        console=console,
+    ).strip()
+    if cleanup_choice in cleanup_map:
+        config["cleanup_remote_files"] = cleanup_map[cleanup_choice]
 
     save_config(config)
     console.print("\n[green]Configurações salvas.[/green]")
