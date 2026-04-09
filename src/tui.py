@@ -51,34 +51,64 @@ def _check_keyboard_input() -> str | None:
     return None
 
 
-def _msvcrt_getwch_input(timeout: float = 0.5) -> str | None:
-    """Fallback input detection using a thread that blocks on msvcrt.getwch().
+class _KeyReader:
+    """Persistent background key reader using stdin in a daemon thread.
 
-    This works even when msvcrt.kbhit() fails inside Rich Live (Windows).
-    Returns the pressed character or None if timeout expires.
+    More reliable than msvcrt.kbhit() inside Rich Live on Windows.
     """
-    if sys.platform != "win32":
-        return None
-    try:
-        import msvcrt
-        result: list[str] = []
 
-        def _wait_key():
-            ch = msvcrt.getwch()
-            # Extended key codes — skip
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._key: str | None = None
+        self._event = threading.Event()
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    def start(self):
+        """Start the background reader thread."""
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Stop the background reader thread."""
+        self._running = False
+
+    def get_key(self, timeout: float = 0.15) -> str | None:
+        """Wait up to *timeout* seconds for a key, then return it (or None)."""
+        if not self._running or not self._thread:
+            return None
+        if self._event.wait(timeout=timeout):
+            self._event.clear()
+            with self._lock:
+                key = self._key
+                self._key = None
+            return key
+        return None
+
+    def _reader(self):
+        """Background thread: continuously read single chars from stdin."""
+        while self._running:
+            try:
+                ch = sys.stdin.read(1)
+            except Exception:
+                break
+            if not ch or not self._running:
+                break
             if ch in ("\xe0", "\x00"):
-                msvcrt.getwch()
-                return
+                # Extended key — consume second byte
+                sys.stdin.read(1)
+                continue
             if ch in ("\r", "\n"):
-                return
-            result.append(ch)
-
-        t = threading.Thread(target=_wait_key, daemon=True)
-        t.start()
-        t.join(timeout=timeout)
-        return result[0] if result else None
-    except (ImportError, OSError):
-        return None
+                continue
+            # Only accept recognized command keys
+            if ch not in "0123456789":
+                continue
+            with self._lock:
+                self._key = ch
+            self._event.set()
 
 
 def show_banner() -> None:
@@ -525,51 +555,46 @@ def interactive_queue_menu(
 ) -> bool:
     """Show queue management menu with real-time updates via rich.Live.
 
-    Polls for keyboard input (non-blocking) while the Live display
-    auto-refreshes the queue table.
+    Uses a persistent background thread reading from sys.stdin for
+    reliable key detection inside Rich Live on Windows.
 
     Returns True if the user chose to exit (0), False otherwise.
     """
-    # Commands that need blocking prompts (job ID, confirmations)
-    # must stop the Live display first so Rich Prompt/Confirm can use stdin.
     PROMPT_COMMANDS = set("34589")
 
     def _make_panel() -> Panel:
         return _render_queue_panel(queue, has_bg_task(), paused_override)
 
-    with Live(_make_panel(), console=console, refresh_per_second=2, screen=False) as live:
-        try:
-            while True:
-                time.sleep(0.1)
-                live.update(_make_panel())
-
-                ch = _check_keyboard_input()
-
-                # Fallback: thread-based input if msvcrt.kbhit() doesn't
-                # detect keypresses inside Rich Live (known Windows issue).
-                if ch is None:
-                    ch = _msvcrt_getwch_input(timeout=0.2)
-
-                if ch is None:
-                    continue
-
-                # Process command
-                if ch == "0":
-                    return True
-                elif ch in "123456789":
-                    if ch in PROMPT_COMMANDS:
-                        # Stop Live so Rich Prompt/Confirm can use stdin cleanly
-                        live.stop()
-                        try:
-                            on_command(ch)
-                        finally:
-                            live.start()
-                    else:
-                        # Commands 1,2,6,7 — no prompts needed
-                        on_command(ch)
+    key_reader = _KeyReader()
+    key_reader.start()
+    try:
+        with Live(_make_panel(), console=console, refresh_per_second=2, screen=False) as live:
+            try:
+                while True:
                     live.update(_make_panel())
-        except KeyboardInterrupt:
-            return False
+
+                    ch = key_reader.get_key(timeout=0.15)
+                    if ch is None:
+                        continue
+
+                    # Process command
+                    if ch == "0":
+                        return True
+                    elif ch in "123456789":
+                        if ch in PROMPT_COMMANDS:
+                            # Stop Live so Rich Prompt/Confirm can use stdin cleanly
+                            live.stop()
+                            try:
+                                on_command(ch)
+                            finally:
+                                live.start()
+                        else:
+                            on_command(ch)
+                        live.update(_make_panel())
+            except KeyboardInterrupt:
+                return False
+    finally:
+        key_reader.stop()
 
 
 def prompt_job_id(queue: QueueManager, action: str) -> str | None:
