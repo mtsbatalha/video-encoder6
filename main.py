@@ -34,12 +34,39 @@ from src.tui import (
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 
+def resolve_output_path(output_path: str, policy: str) -> str | None:
+    """Resolve output path based on file-exists policy.
+
+    Returns the path to use, or None if the file should be skipped.
+    """
+    if not os.path.exists(output_path):
+        return output_path
+
+    if policy == "skip":
+        return None
+
+    if policy == "copy":
+        directory = os.path.dirname(output_path)
+        base = Path(output_path).stem
+        ext = Path(output_path).suffix
+        counter = 1
+        while True:
+            new_path = os.path.join(directory, f"{base}_{counter}{ext}")
+            if not os.path.exists(new_path):
+                return new_path
+            counter += 1
+
+    # "overwrite" — use original path, FFmpeg -y will overwrite
+    return output_path
+
+
 def load_config() -> dict:
     """Load or create default configuration."""
     defaults = {
         "output_dir": os.path.join(os.getcwd(), "conversions"),
         "max_parallel": 2,
         "ffmpeg_path": "ffmpeg",
+        "on_file_exists": "skip",  # skip, overwrite, copy
     }
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -81,9 +108,14 @@ async def convert_single_file(config: dict, queue: QueueManager) -> None:
 
     # Build output path
     output_path = build_output_path(input_path, config["output_dir"], profile.suffix)
+    resolved = resolve_output_path(output_path, config["on_file_exists"])
+
+    if resolved is None:
+        console.print(f"[yellow]Arquivo já existe, pulando:[/yellow] [dim]{output_path}[/dim]")
+        return
 
     # Show info and confirm
-    print_file_info(input_path, profile, output_path)
+    print_file_info(input_path, profile, resolved)
     if not Confirm.ask("Adicionar à fila?", default=True, console=console):
         console.print("[yellow]Cancelado.[/yellow]")
         return
@@ -91,7 +123,7 @@ async def convert_single_file(config: dict, queue: QueueManager) -> None:
     # Add to queue
     job = queue.add(
         input_path=input_path,
-        output_path=output_path,
+        output_path=resolved,
         profile_id=profile.id,
         profile_name=profile.name,
     )
@@ -138,17 +170,27 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
 
     # Add to queue
     jobs_added = []
+    skipped_count = 0
     for f in files:
         output_path = build_output_path(f, config["output_dir"], profile.suffix)
+        resolved = resolve_output_path(output_path, config["on_file_exists"])
+
+        if resolved is None:
+            console.print(f"[yellow]Pulando (já existe):[/yellow] [dim]{Path(f).name}[/dim]")
+            skipped_count += 1
+            continue
+
         job = queue.add(
             input_path=f,
-            output_path=output_path,
+            output_path=resolved,
             profile_id=profile.id,
             profile_name=profile.name,
         )
         jobs_added.append(job)
 
     console.print(f"\n[green]{len(jobs_added)} job(s) adicionado(s) à fila![/green]")
+    if skipped_count:
+        console.print(f"[yellow]{skipped_count} arquivo(s) pulado(s) (já existem).[/yellow]")
     console.print(f"[dim]Use 'Gerenciar Fila' para processar.[/dim]\n")
 
 
@@ -284,7 +326,10 @@ async def settings_menu(config: dict) -> None:
 
     console.print(f"  Pasta de saída: [cyan]{config['output_dir']}[/cyan]")
     console.print(f"  Conversões paralelas: [cyan]{config['max_parallel']}[/cyan]")
-    console.print(f"  FFmpeg: [cyan]{config['ffmpeg_path']}[/cyan]\n")
+    console.print(f"  FFmpeg: [cyan]{config['ffmpeg_path']}[/cyan]")
+
+    labels = {"skip": "Pular existentes", "overwrite": "Sobrescrever", "copy": "Criar cópia"}
+    console.print(f"  Arquivos existentes: [cyan]{labels.get(config['on_file_exists'], config['on_file_exists'])}[/cyan]\n")
 
     # Output directory
     new_dir = Prompt.ask(
@@ -310,6 +355,21 @@ async def settings_menu(config: dict) -> None:
                 console.print("[yellow]Valor fora do intervalo (1-8), mantendo atual.[/yellow]")
         except ValueError:
             console.print("[yellow]Valor inválido, mantendo atual.[/yellow]")
+
+    # On file exists policy
+    console.print("\n[yellow]Quando arquivo de destino já existe:[/yellow]")
+    console.print("  [dim]1[/dim] - Pular (não converte)")
+    console.print("  [dim]2[/dim] - Sobrescrever")
+    console.print("  [dim]3[/dim] - Criar cópia (nome_1, nome_2, ...)")
+    policy_map = {"1": "skip", "2": "overwrite", "3": "copy"}
+    inverse_map = {"skip": "1", "overwrite": "2", "copy": "3"}
+    choice = Prompt.ask(
+        "Escolha (1-3, Enter para manter)",
+        default=inverse_map.get(config["on_file_exists"], "1"),
+        console=console,
+    ).strip()
+    if choice in policy_map:
+        config["on_file_exists"] = policy_map[choice]
 
     save_config(config)
     console.print("\n[green]Configurações salvas.[/green]")
