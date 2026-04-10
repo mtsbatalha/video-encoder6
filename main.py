@@ -558,6 +558,19 @@ async def process_queue(config: dict, queue: QueueManager) -> None:
                 queue.save()
                 console.print("[dim]Fila finalizada após cancelamento.[/dim]")
                 return
+            except Exception as e:
+                # Unexpected error: ensure job is marked failed so it doesn't stay stuck
+                console.print(f"[red]Erro inesperado no job {job.id}: {e}[/red]")
+                import traceback
+                console.print(f"[dim]{traceback.format_exc()}[/dim]")
+                if temp_output and os.path.exists(temp_output):
+                    try:
+                        os.remove(temp_output)
+                    except OSError:
+                        pass
+                queue.mark_job_done(job.id, False, f"Erro inesperado: {e}")
+                queue.save()
+                continue
 
             # Temp dir: copy final file or clean up
             if temp_output and os.path.exists(temp_output):
