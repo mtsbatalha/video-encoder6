@@ -34,6 +34,7 @@ class QueueJob:
     progress_pct: int = 0
     remote_temp_dir: str | None = None
     engine: str = "ffmpeg"  # "ffmpeg" or "handbrake"
+    heartbeat: str | None = None  # ISO timestamp, updated while job is running
 
     def __post_init__(self):
         if not self.created_at:
@@ -200,6 +201,7 @@ class QueueManager:
             if j.status == "pending":
                 j.status = "running"
                 j.started_at = now
+                j.heartbeat = now
                 j.progress_pct = 0
                 self.save()
                 return j
@@ -207,6 +209,7 @@ class QueueManager:
                 if j.scheduled_at <= now:
                     j.status = "running"
                     j.started_at = now
+                    j.heartbeat = now
                     j.progress_pct = 0
                     self.save()
                     return j
@@ -218,6 +221,7 @@ class QueueManager:
             if j.id == job_id:
                 j.progress_pct = pct
                 j.speed = speed
+                j.heartbeat = datetime.now().isoformat()
                 break
 
     def mark_job_done(self, job_id: str, success: bool, error: str | None = None) -> None:
@@ -227,8 +231,48 @@ class QueueManager:
                 j.finished_at = datetime.now().isoformat()
                 j.progress_pct = 100 if success else j.progress_pct
                 j.error = error
+                j.heartbeat = None
                 self.save()
                 break
+
+    def recover_stale_jobs(self, max_age_seconds: int = 900) -> int:
+        """Detect running jobs with no recent heartbeat and mark them as failed.
+
+        Args:
+            max_age_seconds: Seconds without heartbeat update before a job is
+                considered stale (default 900 = 15 minutes).
+
+        Returns:
+            Number of jobs recovered.
+        """
+        now = datetime.now()
+        recovered = 0
+        for j in self._jobs:
+            if j.status != "running":
+                continue
+            if not j.heartbeat:
+                # Running but never sent heartbeat — likely crashed at startup
+                j.status = "failed"
+                j.finished_at = now.isoformat()
+                j.error = "Processo morreu durante conversão (sem heartbeat)"
+                recovered += 1
+                continue
+            try:
+                last = datetime.fromisoformat(j.heartbeat)
+            except (ValueError, TypeError):
+                j.status = "failed"
+                j.finished_at = now.isoformat()
+                j.error = "Processo morreu durante conversão (heartbeat inválido)"
+                recovered += 1
+                continue
+            if (now - last).total_seconds() > max_age_seconds:
+                j.status = "failed"
+                j.finished_at = now.isoformat()
+                j.error = f"Processo morreu durante conversão (sem atualização há {(now - last).total_seconds() / 60:.0f}min)"
+                recovered += 1
+        if recovered:
+            self.save()
+        return recovered
 
     def get_stats(self) -> dict:
         return {

@@ -908,6 +908,11 @@ async def main() -> None:
     config = load_config()
     queue = QueueManager()
 
+    # Recover stale jobs from previous crashed sessions
+    recovered = queue.recover_stale_jobs()
+    if recovered:
+        console.print(f"[yellow]Recuperados {recovered} job(s) presos de sessão anterior.[/yellow]\n")
+
     # Ensure output directory exists
     os.makedirs(config["output_dir"], exist_ok=True)
 
