@@ -13,6 +13,7 @@ class ConversionProfile:
     description: str
     suffix: str
     build_command: Callable[[str, str], list[str]]
+    engine: str = "ffmpeg"  # "ffmpeg" or "handbrake"
 
 
 def _build_4k_sdr(input_path: str, output_path: str) -> list[str]:

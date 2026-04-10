@@ -185,8 +185,8 @@ def show_banner() -> None:
     console.print()
     console.print(
         Panel.fit(
-            "[bold cyan]Video Encoder[/bold cyan] - Conversor de Vídeo FFmpeg + CUDA\n"
-            "[dim]v1.0.0 -- HEVC NVENC | HDR/SDR | Batch Conversion[/dim]",
+            "[bold cyan]Video Encoder[/bold cyan] - Conversor de Vídeo\n"
+            "[dim]v1.1.0 -- FFmpeg | HandBrakeCLI | NVENC | HDR/SDR | Batch Conversion[/dim]",
             border_style="cyan",
         )
     )
@@ -215,7 +215,7 @@ def show_main_menu() -> str:
 def show_others_menu() -> str:
     """Show the 'Outros' submenu and return the user's choice."""
     console.print("[bold]Outros:[/bold]\n")
-    console.print("  [1] Encerrar processos FFmpeg")
+    console.print("  [1] Encerrar processos de encoding (FFmpeg/HandBrake)")
     console.print("  [0] Voltar\n")
 
     choice = Prompt.ask(
@@ -238,10 +238,12 @@ def select_profile_menu(profiles: list[ConversionProfile], multi: bool = False) 
     table = Table(show_header=True, header_style="bold cyan", border_style="dim")
     table.add_column("#", style="yellow", width=4)
     table.add_column("Perfil", style="bold white")
+    table.add_column("Engine", style="magenta", width=10)
     table.add_column("Descrição", style="dim")
 
     for i, profile in enumerate(profiles, 1):
-        table.add_row(str(i), profile.name, profile.description)
+        engine_tag = "[magenta]HandBrake[/magenta]" if profile.engine == "handbrake" else "[cyan]FFmpeg[/cyan]"
+        table.add_row(str(i), profile.name, engine_tag, profile.description)
 
     console.print(table)
     console.print()
@@ -1062,6 +1064,23 @@ def prompt_source_type() -> str:
         console=console,
     )
     return "local" if choice == "1" else "remote"
+
+
+def prompt_engine_selection(default: str = "ffmpeg") -> str:
+    """Ask user to choose encoding engine. Returns 'ffmpeg' or 'handbrake'."""
+    console.print("\n[bold]Engine de codificação:[/bold]\n")
+    console.print("  [1] FFmpeg (NVENC, tonemap Hable)")
+    console.print("  [2] HandBrakeCLI (NVENC, progresso em tempo real)")
+    console.print(f"  [dim]Padrão: {default}[/dim]\n")
+
+    default_choice = "1" if default == "ffmpeg" else "2"
+    choice = Prompt.ask(
+        "Escolha o engine",
+        choices=["1", "2"],
+        default=default_choice,
+        console=console,
+    )
+    return "handbrake" if choice == "2" else "ffmpeg"
 
 
 def prompt_remote_path() -> str:

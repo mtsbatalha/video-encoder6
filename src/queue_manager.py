@@ -33,6 +33,7 @@ class QueueJob:
     speed: str | None = None
     progress_pct: int = 0
     remote_temp_dir: str | None = None
+    engine: str = "ffmpeg"  # "ffmpeg" or "handbrake"
 
     def __post_init__(self):
         if not self.created_at:
@@ -114,6 +115,7 @@ class QueueManager:
         profile_name: str,
         scheduled_at: str | None = None,
         remote_temp_dir: str | None = None,
+        engine: str = "ffmpeg",
     ) -> QueueJob:
         job = QueueJob(
             id=str(uuid.uuid4())[:8],
@@ -124,6 +126,7 @@ class QueueManager:
             scheduled_at=scheduled_at,
             remote_temp_dir=remote_temp_dir,
             status="scheduled" if scheduled_at else "pending",
+            engine=engine,
         )
         self._jobs.append(job)
         self.save()

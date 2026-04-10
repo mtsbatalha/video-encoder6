@@ -20,9 +20,15 @@ from src.file_scanner import (
     scan_video_files,
 )
 from src.profiles import (
-    get_matching_profiles,
-    list_profiles,
-    resolve_auto_profile,
+    ConversionProfile,
+    get_matching_profiles as get_ffmpeg_matching_profiles,
+    list_profiles as list_ffmpeg_profiles,
+    resolve_auto_profile as resolve_ffmpeg_auto_profile,
+)
+from src.hb_profiles import (
+    get_matching_profiles as get_hb_matching_profiles,
+    list_profiles as list_hb_profiles,
+    resolve_auto_profile as resolve_hb_auto_profile,
 )
 from src.queue_manager import QueueManager
 from src.tui import (
@@ -34,6 +40,7 @@ from src.tui import (
     print_file_info,
     prompt_batch_auto_mode,
     prompt_conversion_mode,
+    prompt_engine_selection,
     select_profile_menu,
     show_banner,
     show_main_menu,
@@ -101,6 +108,7 @@ def load_config() -> dict:
         "output_dir": os.path.join(os.getcwd(), "conversions"),
         "max_parallel": 2,
         "ffmpeg_path": "ffmpeg",
+        "default_engine": "ffmpeg",  # "ffmpeg" or "handbrake"
         "on_file_exists": "skip",  # skip, overwrite, copy
         "cleanup_remote_files": "always",  # always, never, ask
         "temp_dir_enabled": False,
@@ -177,13 +185,22 @@ async def convert_single_file(config: dict, queue: QueueManager) -> None:
     # Choose manual or automatic mode
     mode = prompt_conversion_mode()
 
+    # Choose engine
+    engine = prompt_engine_selection(config.get("default_engine", "ffmpeg"))
+
     if mode == "auto":
         is_hdr = detect_hdr(input_path)
         hdr_label = "HDR detectado" if is_hdr else "SDR detectado"
         console.print(f"[green]{hdr_label}[/green]\n")
-        profiles = get_matching_profiles(is_hdr)
+        if engine == "handbrake":
+            profiles = get_hb_matching_profiles(is_hdr)
+        else:
+            profiles = get_ffmpeg_matching_profiles(is_hdr)
     else:
-        profiles = list_profiles()
+        if engine == "handbrake":
+            profiles = list_hb_profiles()
+        else:
+            profiles = list_ffmpeg_profiles()
 
     # Select profile(s) — multi-select enabled
     profiles_list = select_profile_menu(profiles, multi=True)
@@ -219,6 +236,7 @@ async def convert_single_file(config: dict, queue: QueueManager) -> None:
             profile_id=profile.id,
             profile_name=profile.name,
             remote_temp_dir=remote_temp_dir,
+            engine=engine,
         )
         console.print(f"[green]Job adicionado à fila![/green] [dim]ID: {job.id} | Perfil: {profile.name}[/dim]")
 
@@ -277,6 +295,9 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
     # Choose manual or automatic mode
     mode = prompt_conversion_mode()
 
+    # Choose engine
+    engine = prompt_engine_selection(config.get("default_engine", "ffmpeg"))
+
     if mode == "auto":
         # Detect HDR for every file
         console.print("\n[dim]Detectando HDR/SDR em cada arquivo...[/dim]")
@@ -301,7 +322,10 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
         file_profiles: list[tuple[str, ConversionProfile]] = []
         for resolution in resolutions:
             for f in files:
-                profile = resolve_auto_profile(file_hdr[f], resolution, hdr_mode)
+                if engine == "handbrake":
+                    profile = resolve_hb_auto_profile(file_hdr[f], resolution, hdr_mode)
+                else:
+                    profile = resolve_ffmpeg_auto_profile(file_hdr[f], resolution, hdr_mode)
                 file_profiles.append((f, profile))
 
         # Show preview
@@ -333,6 +357,7 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
                 profile_id=profile.id,
                 profile_name=profile.name,
                 remote_temp_dir=remote_temp_dir,
+                engine=engine,
             )
             jobs_added.append(job)
 
@@ -343,7 +368,10 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
 
     else:
         # Manual mode — select profile(s), supports multi-select
-        profiles = list_profiles()
+        if engine == "handbrake":
+            profiles = list_hb_profiles()
+        else:
+            profiles = list_ffmpeg_profiles()
         selected_profiles = select_profile_menu(profiles, multi=True)
         if not selected_profiles:
             return
@@ -384,6 +412,7 @@ async def convert_batch(config: dict, queue: QueueManager) -> None:
                 profile_id=profile.id,
                 profile_name=profile.name,
                 remote_temp_dir=remote_temp_dir,
+                engine=engine,
             )
             jobs_added.append(job)
 
@@ -460,7 +489,8 @@ async def process_queue(config: dict, queue: QueueManager) -> None:
         return
 
     # Import profiles to build commands
-    from src.profiles import get_profile
+    from src.profiles import get_profile as get_ffmpeg_profile
+    from src.hb_profiles import get_profile as get_hb_profile
 
     global _current_conversion
 
@@ -473,8 +503,12 @@ async def process_queue(config: dict, queue: QueueManager) -> None:
             if job is None:
                 break
 
-            # Build command from profile
-            profile = get_profile(job.profile_id)
+            # Build command from profile — use correct engine module
+            engine = getattr(job, "engine", "ffmpeg")
+            if engine == "handbrake":
+                profile = get_hb_profile(job.profile_id)
+            else:
+                profile = get_ffmpeg_profile(job.profile_id)
             if profile is None:
                 queue.mark_job_done(job.id, False, f"Perfil '{job.profile_id}' não encontrado")
                 console.print(f"[dim]  Perfil '{job.profile_id}' não encontrado para job {job.id}[/dim]")
@@ -664,9 +698,12 @@ async def manage_queue_menu(config: dict, queue: QueueManager) -> None:
 
 
 async def kill_ffmpeg_processes() -> None:
-    """Force kill all running ffmpeg processes."""
-    console.print("[bold]Encerrando processos FFmpeg...[/bold]\n")
+    """Force kill all running ffmpeg and HandBrakeCLI processes."""
+    console.print("[bold]Encerrando processos de encoding...[/bold]\n")
 
+    killed = 0
+
+    # Kill FFmpeg
     try:
         if sys.platform == "win32":
             result = subprocess.run(
@@ -675,48 +712,55 @@ async def kill_ffmpeg_processes() -> None:
                 text=True,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
-            output = result.stdout
+            killed += sum(1 for l in result.stdout.split("\n") if "SUCCESS" in l.upper())
         else:
-            result = subprocess.run(
+            subprocess.run(
                 ["pkill", "-9", "ffmpeg"],
                 capture_output=True,
                 text=True,
             )
-            output = result.stdout + result.stderr
-
-        lines = [l for l in output.strip().split("\n") if l]
-        killed = 0
-        for line in lines:
-            if "SUCCESS" in line.upper() or "killed" in line.lower():
-                killed += 1
-
-        # Count how many were killed
-        if sys.platform == "win32":
-            # taskkill output like: "SUCCESS: The process with PID 1234 has been terminated."
-            killed = sum(1 for l in lines if "SUCCESS" in l.upper())
-        else:
-            # pkill returns nothing on success, count from stderr
-            killed = len([l for l in lines if l])
-
-        if killed > 0:
-            console.print(f"[green]{killed} processo(s) FFmpeg encerrado(s).[/green]")
-        else:
-            console.print("[yellow]Nenhum processo FFmpeg encontrado.[/yellow]")
-
-        # Also cancel background queue task
-        global _queue_task
-        if _queue_task and not _queue_task.done():
-            _queue_task.cancel()
-            try:
-                await _queue_task
-            except asyncio.CancelledError:
-                pass
-            console.print("[dim]Processamento de fila cancelado.[/dim]")
-
+            killed += 1  # pkill may have killed multiple
     except FileNotFoundError:
-        console.print("[red]Comando não encontrado.[/red]")
-    except Exception as e:
-        console.print(f"[red]Erro: {e}[/red]")
+        pass
+    except Exception:
+        pass
+
+    # Kill HandBrakeCLI
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["taskkill", "/F", "/IM", "HandBrakeCLI.exe"],
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            killed += sum(1 for l in result.stdout.split("\n") if "SUCCESS" in l.upper())
+        else:
+            subprocess.run(
+                ["pkill", "-9", "HandBrakeCLI"],
+                capture_output=True,
+                text=True,
+            )
+            killed += 1
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    if killed > 0:
+        console.print(f"[green]{killed} processo(s) encerrado(s).[/green]")
+    else:
+        console.print("[yellow]Nenhum processo de encoding encontrado.[/yellow]")
+
+    # Cancel background queue task
+    global _queue_task
+    if _queue_task and not _queue_task.done():
+        _queue_task.cancel()
+        try:
+            await _queue_task
+        except asyncio.CancelledError:
+            pass
+        console.print("[dim]Processamento de fila cancelado.[/dim]")
 
     console.print()
 
@@ -728,6 +772,9 @@ async def settings_menu(config: dict) -> None:
     console.print(f"  Pasta de saída: [cyan]{config['output_dir']}[/cyan]")
     console.print(f"  Conversões paralelas: [cyan]{config['max_parallel']}[/cyan]")
     console.print(f"  FFmpeg: [cyan]{config['ffmpeg_path']}[/cyan]")
+
+    engine_labels = {"ffmpeg": "FFmpeg", "handbrake": "HandBrakeCLI"}
+    console.print(f"  Engine padrão: [cyan]{engine_labels.get(config.get('default_engine', 'ffmpeg'), config.get('default_engine', 'FFmpeg'))}[/cyan]")
 
     labels = {"skip": "Pular existentes", "overwrite": "Sobrescrever", "copy": "Criar cópia"}
     console.print(f"  Arquivos existentes: [cyan]{labels.get(config['on_file_exists'], config['on_file_exists'])}[/cyan]")
@@ -763,6 +810,20 @@ async def settings_menu(config: dict) -> None:
                 console.print("[yellow]Valor fora do intervalo (1-8), mantendo atual.[/yellow]")
         except ValueError:
             console.print("[yellow]Valor inválido, mantendo atual.[/yellow]")
+
+    # Default engine
+    console.print("\n[yellow]Engine de codificação padrão:[/yellow]")
+    console.print("  [dim]1[/dim] - FFmpeg (NVENC, tonemap Hable)")
+    console.print("  [dim]2[/dim] - HandBrakeCLI (NVENC, progresso em tempo real)")
+    engine_map = {"1": "ffmpeg", "2": "handbrake"}
+    inverse_engine = {"ffmpeg": "1", "handbrake": "2"}
+    engine_choice = Prompt.ask(
+        "Escolha (1-2, Enter para manter)",
+        default=inverse_engine.get(config.get("default_engine", "ffmpeg"), "1"),
+        console=console,
+    ).strip()
+    if engine_choice in engine_map:
+        config["default_engine"] = engine_map[engine_choice]
 
     # On file exists policy
     console.print("\n[yellow]Quando arquivo de destino já existe:[/yellow]")

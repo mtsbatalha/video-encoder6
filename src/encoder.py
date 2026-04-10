@@ -230,13 +230,20 @@ async def run_conversion(
     cmd: list[str],
     progress_callback: Callable[[int, str], None] | None = None,
 ) -> ConversionResult:
-    """Run a single conversion with real-time progress polling."""
+    """Run a single conversion with real-time progress polling.
+
+    Dispatches to FFmpeg or HandBrakeCLI worker based on the command.
+    """
     progress = ProgressState()
+
+    # Detect engine from command
+    is_handbrake = cmd[0].lower().startswith("handbrake") if cmd else False
+    worker_fn = _run_handbrake_worker if is_handbrake else _run_ffmpeg_worker
 
     loop = asyncio.get_running_loop()
     future = loop.run_in_executor(
         None,
-        lambda: _run_ffmpeg_worker(input_path, output_path, cmd, progress),
+        lambda: worker_fn(input_path, output_path, cmd, progress),
     )
 
     # Poll progress from worker and call callback in real-time
@@ -283,8 +290,10 @@ async def run_batch_conversions(
     with ThreadPoolExecutor(max_workers=max_parallel) as executor:
         futures = {}
         for job in jobs:
+            is_handbrake = job["cmd"][0].lower().startswith("handbrake") if job["cmd"] else False
+            worker_fn = _run_handbrake_worker if is_handbrake else _run_ffmpeg_worker
             future = executor.submit(
-                _run_ffmpeg_worker,
+                worker_fn,
                 job["input_path"],
                 job["output_path"],
                 job["cmd"],
@@ -329,6 +338,99 @@ def _extract_error(stderr_lines: list[str]) -> str:
             if clean and len(clean) > 5:
                 return clean[:200]
     return "Erro desconhecido do FFmpeg (código de saída não-zero)"
+
+
+# HandBrakeCLI progress regex patterns
+_HB_PROGRESS_RE = re.compile(r"encoding:\s+([\d.]+)%")
+_HB_SPEED_RE = re.compile(r"([\d.]+)\s+fps\b")
+_HB_ERROR_RE = re.compile(r"ERROR|error|failed|Invalid", re.IGNORECASE)
+
+
+def _run_handbrake_worker(
+    input_path: str,
+    output_path: str,
+    cmd: list[str],
+    progress: ProgressState,
+) -> ConversionResult:
+    """Worker function: runs HandBrakeCLI and reports progress via stderr parsing."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    progress.mark_started(input_path)
+
+    creation_flags = 0
+    if sys.platform == "win32":
+        creation_flags = subprocess.CREATE_NO_WINDOW
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=creation_flags,
+        )
+
+        stderr_lines: list[str] = []
+
+        def read_stderr():
+            assert process.stderr is not None
+            for line in process.stderr:
+                decoded = line.decode("utf-8", errors="replace").strip()
+                stderr_lines.append(decoded)
+
+                # Parse progress
+                m_pct = _HB_PROGRESS_RE.search(decoded)
+                m_speed = _HB_SPEED_RE.search(decoded)
+                if m_pct:
+                    pct = min(int(float(m_pct.group(1))), 99)
+                    speed = m_speed.group(1) + " fps" if m_speed else ""
+                    progress.set(input_path, pct, speed)
+
+        t_stderr = threading.Thread(target=read_stderr, daemon=True)
+        t_stderr.start()
+        process.wait()
+        t_stderr.join(timeout=2)
+
+        if process.returncode == 0:
+            _copy_external_subtitles(input_path, output_path)
+            progress.mark_done(input_path)
+            return ConversionResult(
+                file=input_path,
+                success=True,
+                details=f"Salvo em: {output_path}",
+            )
+        else:
+            error_msg = _extract_handbrake_error(stderr_lines)
+            progress.set(input_path, 0, f"ERRO: {error_msg}")
+            return ConversionResult(
+                file=input_path,
+                success=False,
+                details=error_msg,
+            )
+
+    except FileNotFoundError:
+        progress.set(input_path, 0, "HandBrakeCLI não encontrado")
+        return ConversionResult(
+            file=input_path,
+            success=False,
+            details="HandBrakeCLI não encontrado. Instale o HandBrakeCLI.",
+        )
+    except Exception as e:
+        progress.set(input_path, 0, str(e))
+        return ConversionResult(
+            file=input_path,
+            success=False,
+            details=str(e),
+        )
+
+
+def _extract_handbrake_error(stderr_lines: list[str]) -> str:
+    """Extract meaningful error message from HandBrakeCLI stderr output."""
+    for line in reversed(stderr_lines):
+        if _HB_ERROR_RE.search(line):
+            clean = re.sub(r"\[.*?\]", "", line).strip()
+            if clean and len(clean) > 5:
+                return clean[:200]
+    return "Erro desconhecido do HandBrakeCLI (código de saída não-zero)"
 
 
 def _copy_external_subtitles(video_path: str, output_path: str) -> None:
