@@ -1,6 +1,6 @@
 """FFmpeg subprocess execution engine with real-time progress tracking.
 
-Uses frame counting (total_frames via ffprobe vs out_video_frames from
+Uses frame counting (total_frames via ffprobe vs frame from
 FFmpeg's -progress output) for accurate progress reporting, matching
 how ffpb displays progress.
 """
@@ -20,6 +20,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+# Timeout for ffmpeg process (2 hours)
+FFMPEG_TIMEOUT_SECONDS = 86400
 
 from src.file_scanner import find_external_subtitles
 
@@ -57,6 +59,16 @@ class ProgressState:
         with self._lock:
             if key not in self._data:
                 self._data[key] = {"pct": 0, "speed": ""}
+
+
+
+def _get_video_duration(input_path: str) -> float:
+    try:
+        r = subprocess.run(["ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",input_path],capture_output=True,text=True,timeout=30)
+        if r.returncode==0 and r.stdout.strip(): return float(r.stdout.strip())
+    except: pass
+    return 0.0
+
 
 
 def _get_video_frame_count(input_path: str) -> int:
@@ -131,6 +143,7 @@ def _run_ffmpeg_worker(
 
     # Get total video frames for progress calculation
     total_frames = _get_video_frame_count(input_path)
+    total_duration = _get_video_duration(input_path)
 
     progress_fd, progress_file = tempfile.mkstemp(suffix=".progress")
     os.close(progress_fd)
@@ -164,24 +177,52 @@ def _run_ffmpeg_worker(
         t_stderr = threading.Thread(target=read_stderr, daemon=True)
         t_stderr.start()
 
-        # Poll progress file
+        # Poll progress file with timeout and stall detection
+        start_time = time.time()
+        last_frame_count = 0
+        stall_counter = 0
+        
         while process.poll() is None:
-            time.sleep(0.2)
+            time.sleep(0.5)
+            elapsed = time.time() - start_time
+            
+            # Timeout after 2 hours
+            if elapsed > FFMPEG_TIMEOUT_SECONDS:
+                process.kill()
+                progress.set(input_path, 0, f"TIMEOUT: {elapsed/3600:.1f}h")
+                break
+            
             data = _read_progress_file(progress_file)
             if not data:
+                stall_counter += 1
+                if stall_counter > 120:  # 60s without progress
+                    process.kill()
+                    progress.set(input_path, 0, "Stall: sem progresso")
+                    break
                 continue
-
-            # out_video_frames is the number of encoded video frames
-            frames = data.get("out_video_frames", "")
+            
+            stall_counter = 0
+            frames = data.get("frame", "")
             speed = data.get("speed", "")
             speed_str = speed if speed and speed != "N/A" else ""
 
             if frames and frames.isdigit():
                 encoded = int(frames)
+                # Frame stall detection
+                if encoded == last_frame_count:
+                    stall_counter += 1
+                    if stall_counter > 60:  # 30s same frames
+                        process.kill()
+                        progress.set(input_path, 0, "Stall: frames parados")
+                        break
+                else:
+                    stall_counter = 0
+                    last_frame_count = encoded
+                
                 if total_frames > 0:
                     pct = min(int((encoded / total_frames) * 100), 99)
                 else:
-                    pct = min(encoded // 10, 99)  # rough fallback
+                    pct = min(encoded // 10, 99)
                 progress.set(input_path, pct, speed_str)
 
         t_stderr.join(timeout=2)

@@ -2,3 +2,12 @@ __pycache__/
 *.pyc
 *.pyo
 *.env
+.env
+config.json
+conversions/
+remote_files/
+temp_conversion/
+*.log
+*.progress
+*.bak
+queue.json

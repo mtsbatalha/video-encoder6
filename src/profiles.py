@@ -17,16 +17,14 @@ class ConversionProfile:
 
 
 def _build_4k_sdr(input_path: str, output_path: str) -> list[str]:
-    """4K HDR → 4K SDR: tonemap to SDR, HEVC 20M VBR."""
+    """4K HDR -> 4K SDR: GPU decode, tonemap on CPU, encode on GPU."""
     return [
         "ffmpeg",
-        "-hwaccel", "cuda",
-        "-thread_queue_size", "512",
+        "-c:v", "hevc_cuvid",
         "-i", input_path,
         "-map", "0:v:0",
         "-map", "0:a:0",
-        "-map", "0:s?",
-        "-vf", "tonemap=hable:desat=0,format=yuv420p",
+        "-vf", "hwdownload,format=nv12,tonemap=hable:desat=0,hwupload_cuda,format=yuv420p",
         "-c:v", "hevc_nvenc",
         "-preset", "p6",
         "-rc", "vbr",
@@ -42,22 +40,19 @@ def _build_4k_sdr(input_path: str, output_path: str) -> list[str]:
         "-c:a", "aac",
         "-b:a", "384k",
         "-ar", "48000",
-        "-c:s", "copy",
         "-y",
         output_path,
     ]
 
 
 def _build_4k_hdr(input_path: str, output_path: str) -> list[str]:
-    """4K HDR → 4K HDR: keep HDR metadata, HEVC 20M VBR main10."""
+    """4K HDR -> 4K HDR: full GPU pipeline (decode + encode)."""
     return [
         "ffmpeg",
-        "-hwaccel", "cuda",
-        "-thread_queue_size", "512",
+        "-c:v", "hevc_cuvid",
         "-i", input_path,
         "-map", "0:v:0",
         "-map", "0:a:0",
-        "-map", "0:s?",
         "-c:v", "hevc_nvenc",
         "-preset", "p6",
         "-rc", "vbr",
@@ -74,23 +69,20 @@ def _build_4k_hdr(input_path: str, output_path: str) -> list[str]:
         "-c:a", "aac",
         "-b:a", "384k",
         "-ar", "48000",
-        "-c:s", "copy",
         "-y",
         output_path,
     ]
 
 
 def _build_1080p_hdr(input_path: str, output_path: str) -> list[str]:
-    """4K HDR → 1080p HDR: scale down, keep HDR."""
+    """4K HDR -> 1080p HDR: full GPU pipeline (decode + scale + encode)."""
     return [
         "ffmpeg",
-        "-hwaccel", "cuda",
-        "-thread_queue_size", "512",
+        "-c:v", "hevc_cuvid",
         "-i", input_path,
         "-map", "0:v:0",
         "-map", "0:a:0",
-        "-map", "0:s?",
-        "-vf", "scale=1920:1080,format=p010le",
+        "-vf", "hwupload_cuda,scale_cuda=1920:1080:format=p010le",
         "-c:v", "hevc_nvenc",
         "-preset", "p6",
         "-rc", "vbr",
@@ -106,23 +98,20 @@ def _build_1080p_hdr(input_path: str, output_path: str) -> list[str]:
         "-c:a", "aac",
         "-b:a", "384k",
         "-ar", "48000",
-        "-c:s", "copy",
         "-y",
         output_path,
     ]
 
 
 def _build_1080p_sdr(input_path: str, output_path: str) -> list[str]:
-    """4K HDR → 1080p SDR: scale down + tonemap."""
+    """4K HDR -> 1080p SDR: GPU decode, tonemap on CPU, scale on GPU."""
     return [
         "ffmpeg",
-        "-hwaccel", "cuda",
-        "-thread_queue_size", "512",
+        "-c:v", "hevc_cuvid",
         "-i", input_path,
         "-map", "0:v:0",
         "-map", "0:a:0",
-        "-map", "0:s?",
-        "-vf", "scale=1920:1080,tonemap=hable:desat=0,format=yuv420p",
+        "-vf", "hwdownload,format=nv12,tonemap=hable:desat=0,hwupload_cuda,scale_cuda=1920:1080:format=yuv420p",
         "-c:v", "hevc_nvenc",
         "-preset", "p6",
         "-rc", "vbr",
@@ -138,22 +127,20 @@ def _build_1080p_sdr(input_path: str, output_path: str) -> list[str]:
         "-c:a", "aac",
         "-b:a", "384k",
         "-ar", "48000",
-        "-c:s", "copy",
         "-y",
         output_path,
     ]
 
 
 def _build_sdr_to_4k(input_path: str, output_path: str) -> list[str]:
-    """SDR → 4K SDR: keep resolution, no tonemap needed."""
+    """SDR -> 4K SDR: no GPU decode (SDR source), encode on GPU."""
     return [
         "ffmpeg",
         "-hwaccel", "cuda",
-        "-thread_queue_size", "512",
+        "-hwaccel_output_format", "cuda",
         "-i", input_path,
         "-map", "0:v:0",
         "-map", "0:a:0",
-        "-map", "0:s?",
         "-vf", "format=yuv420p",
         "-c:v", "hevc_nvenc",
         "-preset", "p6",
@@ -170,23 +157,21 @@ def _build_sdr_to_4k(input_path: str, output_path: str) -> list[str]:
         "-c:a", "aac",
         "-b:a", "384k",
         "-ar", "48000",
-        "-c:s", "copy",
         "-y",
         output_path,
     ]
 
 
 def _build_sdr_to_1080p(input_path: str, output_path: str) -> list[str]:
-    """SDR → 1080p SDR: scale down, no tonemap needed."""
+    """SDR -> 1080p SDR: hwaccel decode, scale on GPU, encode on GPU."""
     return [
         "ffmpeg",
         "-hwaccel", "cuda",
-        "-thread_queue_size", "512",
+        "-hwaccel_output_format", "cuda",
         "-i", input_path,
         "-map", "0:v:0",
         "-map", "0:a:0",
-        "-map", "0:s?",
-        "-vf", "scale=1920:1080,format=yuv420p",
+        "-vf", "hwdownload,format=nv12,hwupload_cuda,scale_cuda=1920:1080:format=yuv420p",
         "-c:v", "hevc_nvenc",
         "-preset", "p6",
         "-rc", "vbr",
@@ -202,7 +187,6 @@ def _build_sdr_to_1080p(input_path: str, output_path: str) -> list[str]:
         "-c:a", "aac",
         "-b:a", "384k",
         "-ar", "48000",
-        "-c:s", "copy",
         "-y",
         output_path,
     ]
@@ -211,43 +195,43 @@ def _build_sdr_to_1080p(input_path: str, output_path: str) -> list[str]:
 PROFILES: dict[str, ConversionProfile] = {
     "hdr_to_4k_sdr": ConversionProfile(
         id="hdr_to_4k_sdr",
-        name="HDR → 4K SDR",
-        description="Converte HDR para SDR (tonemap Hable). HEVC 20M, áudio AAC 384k.",
+        name="HDR -> 4K SDR",
+        description="GPU decode + tonemap CPU + encode GPU. HEVC 20M, audio AAC 384k.",
         suffix="4K_SDR",
         build_command=_build_4k_sdr,
     ),
     "hdr_to_4k_hdr": ConversionProfile(
         id="hdr_to_4k_hdr",
-        name="HDR → 4K HDR",
-        description="Mantém HDR (DV/HDR). HEVC 20M main10 10-bit, áudio AAC 384k.",
+        name="HDR -> 4K HDR",
+        description="Pipeline completa GPU (decode + encode). HEVC 20M main10 10-bit, audio AAC 384k.",
         suffix="4K_HDR",
         build_command=_build_4k_hdr,
     ),
     "hdr_to_1080p_hdr": ConversionProfile(
         id="hdr_to_1080p_hdr",
-        name="HDR → 1080p HDR",
-        description="Reduz para 1080p mantendo HDR. HEVC 6M main10, áudio AAC 384k.",
+        name="HDR -> 1080p HDR",
+        description="Pipeline completa GPU (decode + scale + encode). HEVC 6M main10, audio AAC 384k.",
         suffix="1080p_HDR",
         build_command=_build_1080p_hdr,
     ),
     "hdr_to_1080p_sdr": ConversionProfile(
         id="hdr_to_1080p_sdr",
-        name="HDR → 1080p SDR",
-        description="Reduz para 1080p e converte para SDR. HEVC 4.5M, áudio AAC 384k.",
+        name="HDR -> 1080p SDR",
+        description="GPU decode + tonemap CPU + scale GPU + encode GPU. HEVC 4.5M, audio AAC 384k.",
         suffix="1080p_SDR",
         build_command=_build_1080p_sdr,
     ),
     "sdr_to_4k_sdr": ConversionProfile(
         id="sdr_to_4k_sdr",
-        name="SDR → 4K SDR",
-        description="Mantém SDR em 4K. HEVC 20M, áudio AAC 384k.",
+        name="SDR -> 4K SDR",
+        description="Mantem SDR em 4K. HEVC 20M, audio AAC 384k.",
         suffix="4K_SDR",
         build_command=_build_sdr_to_4k,
     ),
     "sdr_to_1080p_sdr": ConversionProfile(
         id="sdr_to_1080p_sdr",
-        name="SDR → 1080p SDR",
-        description="Reduz para 1080p mantendo SDR. HEVC 4.5M, áudio AAC 384k.",
+        name="SDR -> 1080p SDR",
+        description="Reduz para 1080p mantendo SDR. HEVC 4.5M, audio AAC 384k.",
         suffix="1080p_SDR",
         build_command=_build_sdr_to_1080p,
     ),
@@ -260,8 +244,8 @@ SDR_PROFILES = ["sdr_to_4k_sdr", "sdr_to_1080p_sdr"]
 def get_matching_profiles(is_hdr: bool) -> list[ConversionProfile]:
     """Return profiles that match the source content type.
 
-    is_hdr=True → HDR source profiles (tonemap available)
-    is_hdr=False → SDR source profiles (no tonemap needed)
+    is_hdr=True -> HDR source profiles (tonemap available)
+    is_hdr=False -> SDR source profiles (no tonemap needed)
     """
     ids = HDR_PROFILES if is_hdr else SDR_PROFILES
     return [PROFILES[pid] for pid in ids]
@@ -284,7 +268,7 @@ def resolve_auto_profile(is_hdr: bool, resolution: str, hdr_mode: str) -> Conver
         else:
             return PROFILES["hdr_to_1080p_hdr" if hdr_mode == "hdr" else "hdr_to_1080p_sdr"]
     else:
-        # SDR source → always SDR output
+        # SDR source -> always SDR output
         if resolution == "4k":
             return PROFILES["sdr_to_4k_sdr"]
         else:
