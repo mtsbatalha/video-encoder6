@@ -804,6 +804,8 @@ async def watch_queue_with_processing(
     _task_was_running = True
     try:
         while True:
+            # Reload queue from disk to pick up updates from background processing
+            queue._load()
             stats = queue.get_stats()
             is_paused = stats["paused"]
             status_tag = "[red]PAUSADA[/red]" if is_paused else "[green]ATIVA[/green]"
